@@ -68,7 +68,7 @@
     "publish": [
       {
         "provider": "github",
-        "owner": "henners",
+        "owner": "realhenners",
         "repo": "accretion",
         "releaseType": "draft"
       }
