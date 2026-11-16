@@ -1,0 +1,949 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Accretion</title>
+<style>
+  /* Windows 11 settings-page conventions: the base page colour, Segoe UI Variable, setting cards,
+     the user's accent colour, light/dark from the system. */
+  :root {
+    --accent: #0078d4; --bg: #f3f3f3;
+    --text: #1a1a1a; --text2: #5d5d5d; --card: rgba(255,255,255,0.7); --card-hover: rgba(249,249,249,0.5);
+    --stroke: rgba(0,0,0,0.0578); --control: rgba(255,255,255,0.7); --control-stroke: rgba(0,0,0,0.0803);
+    --track: rgba(0,0,0,0.4458); --thumb-ring: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #202020; --text: #ffffff; --text2: #c5c5c5; --card: rgba(255,255,255,0.0512); --card-hover: rgba(255,255,255,0.0837);
+      --stroke: rgba(0,0,0,0.1); --control: rgba(255,255,255,0.0605); --control-stroke: rgba(255,255,255,0.0698);
+      --track: rgba(255,255,255,0.5442); --thumb-ring: #454545;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { background: var(--bg); }
+  body { margin: 0; padding: 28px 32px 32px; color: var(--text); user-select: none;
+         font: 14px/20px "Segoe UI Variable Text", "Segoe UI", sans-serif; }
+  h1 { font: 600 28px/36px "Segoe UI Variable Display", "Segoe UI", sans-serif; margin: 0 0 4px; }
+  .readout { color: var(--text2); font-size: 12px; margin: 0 0 18px; font-variant-numeric: tabular-nums; }
+  h2 { font: 600 14px/20px "Segoe UI Variable Text", "Segoe UI", sans-serif; margin: 26px 0 8px; }
+
+  .card { display: flex; align-items: center; gap: 16px; min-height: 68px; padding: 12px 16px;
+          background: var(--card); border: 1px solid var(--stroke); border-radius: 4px; margin-bottom: 3px; }
+  .card:hover { background: var(--card-hover); }
+  .card .text { flex: 1; min-width: 0; }
+  .card .title { display: block; }
+  .card .desc { display: block; font-size: 12px; line-height: 16px; color: var(--text2); margin-top: 1px; }
+  .card .value { font-variant-numeric: tabular-nums; color: var(--text2); min-width: 48px; text-align: right; }
+  .card.off { opacity: 0.45; pointer-events: none; }
+
+  /* Slider, Windows 11 style: thin track filled with the accent, round thumb with a dot that grows on hover. */
+  input[type=range] { -webkit-appearance: none; appearance: none; width: 170px; height: 20px; background: none; margin: 0; }
+  input[type=range]::-webkit-slider-runnable-track { height: 4px; border-radius: 2px;
+    background: linear-gradient(to right, var(--accent) var(--p, 50%), var(--track) var(--p, 50%)); }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 20px; height: 20px; margin-top: -8px; border-radius: 50%;
+    background: radial-gradient(circle, var(--accent) 0 5px, var(--thumb-ring) 6px); box-shadow: 0 0 0 1px var(--control-stroke); }
+  input[type=range]:hover::-webkit-slider-thumb { background: radial-gradient(circle, var(--accent) 0 6px, var(--thumb-ring) 7px); }
+  input[type=range]:active::-webkit-slider-thumb { background: radial-gradient(circle, var(--accent) 0 4px, var(--thumb-ring) 5px); }
+  input[type=range]:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; border-radius: 4px; }
+
+  /* Toggle switch, Windows 11 style. */
+  .switch { position: relative; width: 40px; height: 20px; flex: none; }
+  .switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+  .switch span { position: absolute; inset: 0; border-radius: 10px; border: 1px solid var(--track); pointer-events: none; }
+  .switch span::after { content: ''; position: absolute; width: 12px; height: 12px; left: 3px; top: 3px; border-radius: 50%;
+    background: var(--text2); transition: left 0.15s; }
+  .switch input:checked + span { background: var(--accent); border-color: var(--accent); }
+  .switch input:checked + span::after { left: 23px; background: #fff; }
+  .switch input:focus-visible + span { outline: 2px solid var(--text); outline-offset: 2px; }
+
+  select, button, input[type=text], input[type=search] { font: inherit; color: var(--text); background: var(--control); border: 1px solid var(--control-stroke);
+    border-bottom-color: rgba(0,0,0,0.16); border-radius: 4px; height: 32px; padding: 0 12px; }
+  select { min-width: 170px; padding-right: 8px; }
+  select option { background: Canvas; color: CanvasText; }
+  input[type=text] { width: 170px; user-select: text; }
+  button { padding: 0 14px; white-space: nowrap; }
+  select:hover, button:hover { background: var(--card-hover); }
+  button:disabled { opacity: 0.45; }
+  select:focus-visible, button:focus-visible, input[type=text]:focus-visible, input[type=search]:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+  .row { display: flex; gap: 6px; }
+
+  .swatch { position: relative; width: 48px; height: 32px; border-radius: 4px; border: 1px solid var(--control-stroke); overflow: hidden; }
+  .swatch input { position: absolute; inset: -8px; width: calc(100% + 16px); height: calc(100% + 16px); border: 0; padding: 0; cursor: pointer; }
+
+  .keys { display: grid; grid-template-columns: auto 1fr; gap: 6px 24px; padding: 14px 16px; background: var(--card);
+          border: 1px solid var(--stroke); border-radius: 4px; }
+  .keys dt { color: var(--text); white-space: nowrap; }
+  .keys dd { margin: 0; color: var(--text2); }
+  .footer { display: flex; justify-content: flex-end; margin-top: 20px; }
+  .global-only.hidden { display: none; }
+  .pet .name { font: 600 14px/20px "Segoe UI Variable Text", "Segoe UI", sans-serif; color: var(--text); background: transparent; border: 1px solid transparent;
+               border-radius: 4px; padding: 3px 6px; margin: -4px 0 0 -7px; width: 100%; max-width: 280px; }
+  .pet .name:hover { background: var(--control); }
+  .pet .name:focus { outline: none; background: var(--control); border-color: var(--control-stroke); border-bottom: 2px solid var(--accent); }
+  .pet { flex-wrap: wrap; }
+  .pet .text { flex: 1; min-width: 200px; }
+  .pet details { flex-basis: 100%; color: var(--text2); font-size: 12px; line-height: 18px; margin-top: 2px; }
+  .pet summary { cursor: default; color: var(--text); font-size: 13px; }
+  .pet details h3 { font-weight: 600; font-size: 12px; line-height: 18px; color: var(--text); margin: 10px 0 2px; }
+  .tree, .tree ul { list-style: none; margin: 0; padding-left: 14px; }
+  .tree { padding-left: 0; }
+  .tree li::before { content: "\2514\2009"; color: var(--text2); }
+  .tree > li::before { content: ""; }
+  .ach { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+  .ach .card { min-height: 56px; }
+  .ach .locked { opacity: 0.5; }
+  .unlock h3 { font-weight: 600; font-size: 13px; line-height: 18px; color: var(--text2); margin: 14px 0 6px; }
+  .unlock .card { min-height: 72px; gap: 14px; }
+  .unlock img, .pet img.portrait { width: 64px; height: 64px; border-radius: 4px; flex: none; background: #0b0d14; }
+  .unlock .locked img { filter: grayscale(0.7) brightness(0.6); }
+  .unlock .locked .title, .unlock .locked .desc { opacity: 0.55; }
+  .pet img.portrait { width: 72px; height: 72px; }
+  #unlockScope { font-size: 12px; color: var(--text2); margin: -4px 0 4px; }
+  #importMsg { font-size: 12px; color: var(--text2); }
+  /* Tabs */
+  header.top { position: sticky; top: 0; z-index: 2; background: var(--bg); margin: -28px -32px 8px; padding: 22px 32px 0; }
+  .titlebar { display: flex; align-items: baseline; gap: 14px; }
+  .titlebar h1 { margin: 0; }
+  .titlebar .readout { margin: 0; }
+  #search { width: 100%; margin: 12px 0 8px; height: 32px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 1px solid var(--stroke); padding-bottom: 6px; }
+  .tabs button { border: none; background: transparent; height: 30px; padding: 0 10px; border-radius: 4px; color: var(--text2); position: relative; }
+  .tabs button:hover { background: var(--card-hover); color: var(--text); }
+  .tabs button[aria-selected="true"] { color: var(--text); font-weight: 600; }
+  .tabs button[aria-selected="true"]::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: -7px; height: 3px; border-radius: 2px; background: var(--accent); }
+  section.tab:not(.on) { display: none; }
+  body.searching section.tab { display: block; }
+  body.searching .tabs, body.searching #scopeCard { display: none; }
+  .search-hidden { display: none !important; }
+  .col { display: flex; flex-direction: column; gap: 6px; }
+  .breed { flex-wrap: wrap; }
+  .breed .col { flex-basis: 100%; }
+  .breed .row input { flex: 1; width: auto; }
+  .pet details { min-width: 0; overflow: hidden; }
+  .pet details > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .stomach .item { display: flex; align-items: center; gap: 8px; margin: 4px 0; min-width: 0; }
+  .stomach img { height: 32px; max-width: 64px; border-radius: 3px; background: #111; }
+  .stomach .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+  .journal .day { margin: 6px 0; }
+  .journal .day b { color: var(--text); font-weight: 600; }
+  .journal .day div { white-space: normal; overflow: visible; }
+  #selftest .row { gap: 8px; }
+  .result { display: flex; gap: 10px; margin: 8px 0; align-items: flex-start; }
+  .result .mark { width: 18px; height: 18px; border-radius: 50%; flex: none; display: grid; place-items: center; color: #fff; font-size: 11px; font-weight: 600; margin-top: 1px; }
+  .result .pass { background: #0f7b0f; } .result .warn { background: #9d5d00; } .result .fail { background: #c42b1c; }
+  .result b { display: block; }
+  .result span.d { color: var(--text2); font-size: 12px; line-height: 17px; }
+  .about details { margin-top: 6px; color: var(--text2); font-size: 12px; }
+  .about summary { color: var(--text); font-size: 13px; cursor: default; }
+  .about h4 { margin: 10px 0 2px; font-size: 12px; color: var(--text); }
+  .about ul { margin: 0; padding-left: 18px; }
+  .gallery { display: flex; gap: 6px; overflow-x: auto; padding: 4px 0 8px; }
+  .gallery figure { margin: 0; flex: none; text-align: center; font-size: 11px; }
+  .gallery img { width: 72px; height: 72px; border-radius: 4px; display: block; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; scroll-behavior: auto !important; } }
+  .hdr { margin-left: auto; display: flex; gap: 6px; }
+  .hdr button { height: 28px; padding: 0 10px; }
+  .hdr button[aria-pressed="true"] { border-color: var(--accent); }
+  .preview { min-height: 0; padding: 8px 12px; }
+  .preview iframe { width: 132px; height: 132px; border: 0; border-radius: 6px; background: #0b0d14; flex: none; }
+  .swatches { display: flex; flex-wrap: wrap; gap: 6px; margin: -2px 0 4px 16px; }
+  .swatches button { width: 24px; height: 24px; min-width: 0; padding: 0; border-radius: 50%; border: 2px solid transparent; }
+  .swatches button[aria-pressed="true"] { border-color: var(--text); }
+  /* Compact: smaller cards, no explanations (they're still in each control's name for screen readers) */
+  body.compact { padding: 16px 18px 18px; }
+  body.compact header.top { margin: -16px -18px 6px; padding: 12px 18px 0; }
+  body.compact h1 { font-size: 20px; line-height: 26px; }
+  body.compact .card { min-height: 40px; padding: 6px 12px; margin-bottom: 2px; }
+  body.compact .card .desc { display: none; }
+  body.compact .card.preview .desc, body.compact .result .d { display: block; }
+  body.compact h2 { margin: 14px 0 4px; }
+</style>
+</head>
+<body>
+  <header class="top">
+    <div class="titlebar">
+      <h1>Accretion</h1>
+      <p class="readout" id="readout" aria-live="polite">–</p>
+      <div class="hdr"><button id="undoBtn" disabled title="Undo the last change (Ctrl+Z)">Undo</button><button id="compactBtn" aria-pressed="false">Compact</button></div>
+    </div>
+    <input id="search" type="search" placeholder="Find a setting" aria-label="Find a setting" spellcheck="false">
+    <nav class="tabs" role="tablist" aria-label="Settings sections" id="tabs">
+      <button role="tab" data-tab="pets">Black holes</button>
+      <button role="tab" data-tab="look">Look</button>
+      <button role="tab" data-tab="unlocks">Unlocks</button>
+      <button role="tab" data-tab="sound">Sound</button>
+      <button role="tab" data-tab="behaviour">Behaviour</button>
+      <button role="tab" data-tab="achievements">Achievements</button>
+      <button role="tab" data-tab="system">System</button>
+      <button role="tab" data-tab="help">Help</button>
+    </nav>
+  </header>
+
+  <main>
+  <section class="tab" data-tab="pets" role="tabpanel" aria-label="Black holes">
+    <div id="pets"></div>
+    <h2>Add one</h2>
+    <div class="card">
+      <div class="text"><span class="title">From a share code</span><span class="desc" id="importMsg">Paste a code someone shared (right-click a black hole → Copy share code).</span></div>
+      <div class="row"><input id="importCode" type="text" placeholder="ACC1-…" spellcheck="false" aria-label="Share code"><button id="importBtn">Add</button></div>
+    </div>
+    <div class="card breed">
+      <div class="text"><span class="title">Breed a baby</span><span class="desc" id="breedMsg">Two parents: share codes, or your own black holes. The baby gets a bit of each: colours blended, traits and looks mixed, and a small chance of something rare.</span></div>
+      <div class="col">
+        <div class="row"><select id="breedPickA" aria-label="First parent"></select><input id="breedA" type="text" placeholder="ACC1-…" spellcheck="false" aria-label="First parent's share code"></div>
+        <div class="row"><select id="breedPickB" aria-label="Second parent"></select><input id="breedB" type="text" placeholder="ACC1-…" spellcheck="false" aria-label="Second parent's share code"></div>
+        <div class="row"><button id="breedBtn">Breed</button></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="card" id="scopeCard">
+    <div class="text"><span class="title">Applies to</span><span class="desc" id="scopeDesc">Every black hole.</span></div>
+    <select id="scope" aria-label="Applies to"><option value="all">All black holes</option></select>
+  </div>
+
+  <section class="tab" data-tab="look" role="tabpanel" aria-label="Look">
+    <div class="card preview">
+      <iframe id="preview" title="Live preview of the black hole" tabindex="-1"></iframe>
+      <div class="text"><span class="title">Preview</span><span class="desc" id="previewDesc">Live, as you change things.</span></div>
+    </div>
+    <h2>Appearance</h2>
+    <div class="card">
+      <div class="text"><span class="title">Style</span><span class="desc" id="lookDesc"></span></div>
+      <select id="look" data-key="look">
+        <option value="classic">Classic</option>
+        <option value="quiet">Quiet (no disk)</option>
+        <option value="thin">Thin disk</option>
+        <option value="blazing">Blazing</option>
+      </select>
+    </div>
+    <div class="card global-only">
+      <div class="text"><span class="title">Size</span><span class="desc">Scales every black hole. Scroll on one to change just its mass.</span></div>
+      <span class="value" data-for="size"></span><input id="size" type="range" min="0.4" max="2" step="0.05">
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Tilt</span><span class="desc">How far the disk is tipped toward you.</span></div>
+      <span class="value" data-for="tilt"></span><input id="tilt" type="range" min="-20" max="60" step="1">
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Glow</span><span class="desc">Light bleeding around the brightest parts, as it does in a camera. Off skips that work entirely.</span></div>
+      <span class="value" data-for="bloom"></span><input id="bloom" type="range" min="0" max="1" step="0.05">
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Einstein ring</span><span class="desc">A distant star exactly behind the black hole, bent into a ring of light.</span></div>
+      <label class="switch"><input id="einsteinStar" type="checkbox"><span></span></label>
+    </div>
+    <div class="card global-only">
+      <div class="text"><span class="title">Motion blur</span><span class="desc">Smears it along its path when it moves fast.</span></div>
+      <label class="switch"><input id="motionBlur" type="checkbox"><span></span></label>
+    </div>
+
+    <h2>Light</h2>
+    <div class="card">
+      <div class="text"><span class="title">Colour grade</span><span class="desc">How the light is coloured, like a camera's picture style. The desktop behind isn't changed.</span></div>
+      <select id="grade"><option value="natural">Natural</option><option value="filmic">Filmic</option><option value="warm">Warm (cinema)</option><option value="falsecolor">False colour (telescope)</option><option value="mono">Black and white</option></select>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Shadow on what's behind</span><span class="desc">A soft shadow under the disk on the windows and desktop behind it.</span></div>
+      <label class="switch"><input id="castShadow" type="checkbox"><span></span></label>
+    </div>
+    <div class="card global-only">
+      <div class="text"><span class="title">Blueprint view</span><span class="desc">Draws the paths light takes around each black hole, with the horizon, photon sphere, shadow edge and innermost stable orbit marked. Red paths fall in.</span></div>
+      <label class="switch"><input id="blueprint" type="checkbox"><span></span></label>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Doppler colour</span><span class="desc">Gas coming toward you looks bluer and hotter, gas going away redder, as it really would.</span></div>
+      <label class="switch"><input id="dopplerColor" type="checkbox"><span></span></label>
+    </div>
+
+    <h2>Accretion disk</h2>
+    <div class="card">
+      <div class="text"><span class="title">Colour</span><span class="desc">The glow of the cooler gas. Hot spots still burn toward white.</span></div>
+      <label class="swatch" title="Disk colour"><input id="diskColor" type="color" aria-label="Disk colour"></label>
+    </div>
+    <div class="swatches" id="swatches" aria-label="Quick colours"></div>
+    <div class="card">
+      <div class="text"><span class="title">Temperature</span><span class="desc">Hotter gas is brighter and whiter.</span></div>
+      <span class="value" data-for="diskTemp"></span><input id="diskTemp" type="range" min="0" max="1" step="0.01">
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Thickness</span><span class="desc">Height of the gas compared with its distance out. Real thin disks are about 1–10%. A thicker disk shades its own outer parts.</span></div>
+      <span class="value" data-for="thickness"></span><input id="thickness" type="range" min="0" max="0.3" step="0.01">
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Orbit speed</span><span class="desc">The inner disk always laps the outer disk.</span></div>
+      <span class="value" data-for="spinSpeed"></span><input id="spinSpeed" type="range" min="0" max="3" step="0.05">
+    </div>
+
+    <h2>Black hole</h2>
+    <div class="card">
+      <div class="text"><span class="title">Spin</span><span class="desc">0 doesn't spin. Higher spin drags light around one side, flattening the shadow, and lets the disk come closer. Feeding spins it up.</span></div>
+      <span class="value" data-for="bhSpin"></span><input id="bhSpin" type="range" min="0" max="0.99" step="0.01">
+    </div>
+
+    <h2>Saved looks</h2>
+    <div class="card">
+      <div class="text"><span class="title">Load a look</span><span class="desc">Style, colours, thickness, tilt, spin, glow, ring and effects together.</span></div>
+      <div class="row"><select id="looks" aria-label="Saved looks"></select><button id="loadLook">Load</button><button id="deleteLook">Delete</button></div>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Save the current look</span></div>
+      <div class="row"><input id="lookName" type="text" placeholder="Name" maxlength="40" aria-label="Look name"><button id="saveLook">Save</button></div>
+    </div>
+    <div class="footer"><button id="reset">Reset to defaults</button></div>
+  </section>
+
+  <section class="tab" data-tab="unlocks" role="tabpanel" aria-label="Unlocks">
+    <p id="unlockScope"></p>
+    <div class="unlock" id="unlocks"></div>
+  </section>
+
+  <section class="tab" data-tab="sound" role="tabpanel" aria-label="Sound">
+    <div class="card">
+      <div class="text"><span class="title">Sound</span><span class="desc">A low hum, a gulp when it feeds, a chirp when two merge, and the burst when it evaporates. It sits left or right with where the black holes are.</span></div>
+      <label class="switch"><input id="sound" type="checkbox"><span></span></label>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Volume</span></div>
+      <span class="value" data-for="volume"></span><input id="volume" type="range" min="0" max="1" step="0.05">
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Sound theme</span><span class="desc">Sonification: a deep, slowly drifting chord pitched to the black hole's mass (heavier is lower), like NASA's sonifications of real black holes.</span></div>
+      <select id="soundTheme"><option value="hum">Hum</option><option value="sonification">Sonification</option></select>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Dance to music on the PC</span><span class="desc">When music plays in any app, black holes sway to the beat. The PC's sound is only listened to for the beat, live; nothing is recorded.</span></div>
+      <label class="switch"><input id="danceToMusic" type="checkbox"><span></span></label>
+    </div>
+  </section>
+
+  <section class="tab" data-tab="behaviour" role="tabpanel" aria-label="Behaviour">
+    <div class="card">
+      <div class="text"><span class="title">Play with windows</span><span class="desc">When it's bored and sitting next to a small window, it bats it a few pixels and back. Never the window you're using, a maximised one, or anything big.</span></div>
+      <label class="switch"><input id="playWithWindows" type="checkbox"><span></span></label>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Slowly evaporate when unfed</span><span class="desc">After three days without food, a black hole loses about 2% of its mass a day (Hawking radiation, sped up a great deal). It never goes below its starting size.</span></div>
+      <label class="switch"><input id="evaporate" type="checkbox"><span></span></label>
+    </div>
+  </section>
+
+  <section class="tab" data-tab="achievements" role="tabpanel" aria-label="Achievements">
+    <p class="desc" id="achCount" style="margin:0 0 8px;color:var(--text2);font-size:12px"></p>
+    <div class="ach" id="achs"></div>
+  </section>
+
+  <section class="tab" data-tab="system" role="tabpanel" aria-label="System">
+    <h2>Startup</h2>
+    <div class="card">
+      <div class="text"><span class="title">Start with Windows</span><span class="desc">Your black holes are there when you sign in.</span></div>
+      <label class="switch"><input id="startWithWindows" type="checkbox"><span></span></label>
+    </div>
+
+    <h2>Performance</h2>
+    <div class="card">
+      <div class="text"><span class="title">When nothing's moving</span><span class="desc">Saves power while the black hole sits still and the screen behind it doesn't change.</span></div>
+      <select id="idle"><option value="slow">Keep turning, slowly (20 fps)</option><option value="freeze">Freeze</option></select>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Render quality</span><span class="desc">Automatic measures how long the graphics card takes and lowers the resolution a little when frames start dropping. Balanced and Performance also take longer steps along each ray of light.</span></div>
+      <select id="quality"><option value="auto">Automatic</option><option value="high">Full resolution</option><option value="balanced">Balanced</option><option value="performance">Performance</option></select>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Background refresh rate</span><span class="desc" id="rateDesc">How often the bent desktop behind the black hole updates.</span></div>
+      <span class="value" data-for="captureRate"></span><input id="captureRate" type="range" min="15" max="60" step="5">
+    </div>
+
+    <h2>Updates</h2>
+    <div class="card">
+      <div class="text"><span class="title">Check for updates automatically</span><span class="desc" id="updateLine">New versions come from this project's GitHub Releases, download in the background, and install when you quit.</span></div>
+      <label class="switch"><input id="autoUpdate" type="checkbox"><span></span></label>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Update now</span><span class="desc" id="updateState">–</span></div>
+      <div class="row"><button id="checkUpdate">Check now</button><button id="installUpdate" hidden>Restart to update</button></div>
+    </div>
+
+    <h2>Monitors</h2>
+    <div id="monitors"></div>
+
+    <h2>Profiles</h2>
+    <div class="card">
+      <div class="text"><span class="title">Switch profile</span><span class="desc">A profile is a whole set of settings (looks, sound, behaviour, performance), say a quiet one for work and a lively one for later. Pets and achievements aren't part of it. Also in the tray menu.</span></div>
+      <div class="row"><select id="profiles" aria-label="Profiles"></select><button id="loadProfile">Load</button><button id="deleteProfile">Delete</button></div>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Save these settings as a profile</span></div>
+      <div class="row"><input id="profileName" type="text" placeholder="Name" maxlength="40" aria-label="Profile name"><button id="saveProfile">Save</button></div>
+    </div>
+
+    <h2>Backup</h2>
+    <div class="card">
+      <div class="text"><span class="title">Export or import everything</span><span class="desc" id="backupMsg">Settings, saved looks, profiles, achievements and your black holes, in one file. Importing replaces the black holes on screen with the ones in the file.</span></div>
+      <div class="row"><button id="exportAll">Export…</button><button id="importAll">Import…</button></div>
+    </div>
+
+    <h2>Accessibility</h2>
+    <div class="card">
+      <div class="text"><span class="title">Reduce motion</span><span class="desc">No wobbling, swaying, ripples or glitch stutter. Windows also follow your Windows animation setting here.</span></div>
+      <label class="switch"><input id="reduceMotion" type="checkbox"><span></span></label>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Larger labels</span><span class="desc">Bigger, higher-contrast mood tags and messages on the desktop.</span></div>
+      <label class="switch"><input id="largeLabels" type="checkbox"><span></span></label>
+    </div>
+
+    <div class="footer"><button id="resetAll">Reset all settings</button></div>
+  </section>
+
+  <section class="tab" data-tab="help" role="tabpanel" aria-label="Help">
+    <div class="card">
+      <div class="text"><span class="title">Welcome tour</span><span class="desc">The four cards from the first time you opened Accretion.</span></div>
+      <button id="showTour">Show the tour</button>
+    </div>
+    <div class="card about">
+      <div class="text"><span class="title">About Accretion</span><span class="desc" id="aboutLine"></span>
+        <details id="changes"><summary>What's new</summary><div id="changelog"></div></details></div>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Crash reports</span><span class="desc" id="crashLine">If something goes wrong, a report is saved on this PC. Nothing is ever sent anywhere.</span></div>
+      <div class="row"><button id="openCrashes">Open folder</button><button id="openLogs">Logs</button></div>
+    </div>
+    <div class="card">
+      <div class="text"><span class="title">Plugins</span><span class="desc" id="pluginLine">Your own looks and food rules, as .json files (data only, no code). There's an example in the folder.</span></div>
+      <div class="row"><button id="openPlugins">Open folder</button><button id="reloadPlugins">Reload</button></div>
+    </div>
+    <div class="card" id="selftest">
+      <div class="text"><span class="title">Self-test</span><span class="desc">Checks graphics, screen capture, the window helper, sound, saving, shortcuts and monitors, and says plainly what's wrong if anything is.</span>
+        <div id="results"></div></div>
+      <button id="runTest">Run</button>
+    </div>
+    <h2>Controls</h2>
+    <dl class="keys" id="keys">
+      <dt>Drag</dt><dd>Move it. Let go while moving to throw it.</dd>
+      <dt>Shift + drag</dt><dd>Move it slowly, for fine positioning.</dd>
+      <dt>Drop on a window</dt><dd>Hold it over a window for a moment, then let go: it swallows the window. Right-click to give windows back.</dd>
+      <dt>Drag things onto it</dt><dd>Files, folders, a window you're dragging, selected text, a link, or a browser tab by its address-bar icon.</dd>
+      <dt>Scroll</dt><dd>Change its mass.</dd>
+      <dt>Double-click</dt><dd>Feed it a clump of gas.</dd>
+      <dt>Shift + double-click</dt><dd>Throw in a star and watch it get torn apart.</dd>
+      <dt>Hold Alt</dt><dd>See through it.</dd>
+      <dt>Right-click</dt><dd>Settings, screenshot, release windows, close.</dd>
+      <dt>Open Accretion again</dt><dd>Add another black hole.</dd>
+      <dt>Circle its edge slowly</dt><dd>Pet it.</dd>
+      <dt>Ctrl + drag from it</dt><dd>Draw a path. Let go and it follows the path, eating anything the path runs into.</dd>
+      <dt>Shake it up and down</dt><dd>Things fall out of its stomach, one at a time. (Side to side just makes it queasy.)</dd>
+    </dl>
+  </section>
+  </main>
+
+<script>
+const api = window.app;
+const DESC = {
+  classic: 'A bright disk and the bent desktop behind it.',
+  quiet: 'No disk, just the bending, like a lone black hole in space.',
+  thin: 'A fainter, narrower disk.',
+  blazing: 'A hotter, brighter disk.',
+};
+const FMT = {
+  size: v => `${Math.round(v * 100)}%`, tilt: v => `${v}°`, diskTemp: v => `${Math.round(v * 100)}%`,
+  thickness: v => `${Math.round(v * 100)}%`, spinSpeed: v => `${(+v).toFixed(1)}×`, bhSpin: v => (+v).toFixed(2),
+  bloom: v => `${Math.round(v * 100)}%`, volume: v => `${Math.round(v * 100)}%`, captureRate: v => `${v} fps`,
+};
+const RANGES = ['size', 'tilt', 'diskTemp', 'thickness', 'spinSpeed', 'bhSpin', 'bloom', 'volume', 'captureRate'];
+const SWITCHES = ['autoUpdate', 'einsteinStar', 'motionBlur', 'sound', 'danceToMusic', 'startWithWindows', 'dopplerColor', 'playWithWindows', 'evaporate', 'reduceMotion', 'largeLabels', 'castShadow', 'blueprint'];
+const SELECTS = ['look', 'idle', 'quality', 'grade', 'soundTheme'];
+let settings = null, holes = [], scope = 'all', lookKeys = [];
+
+const $ = id => document.getElementById(id);
+const values = () => scope === 'all' ? settings : { ...settings, ...(holes.find(h => h.id === scope)?.overrides || {}) };
+
+function paint(el) {   // accent fill up to the thumb, and the value label
+  el.style.setProperty('--p', `${(el.value - el.min) / (el.max - el.min) * 100}%`);
+  const out = document.querySelector(`[data-for="${el.id}"]`);
+  if (out) out.textContent = FMT[el.id](el.value);
+}
+function show() {
+  if (!settings) return;
+  if (achList.length) showAch();
+  const v = values();
+  for (const id of [...RANGES, ...SELECTS, 'diskColor']) { const el = $(id); if (document.activeElement !== el) el.value = v[id]; if (RANGES.includes(id)) paint(el); }
+  for (const id of SWITCHES) $(id).checked = !!v[id];
+  $('lookDesc').textContent = DESC[v.look] || '';
+  // A single black hole can override its look; size, sound and performance are always for the whole app.
+  for (const el of document.querySelectorAll('.global-only')) el.classList.toggle('hidden', scope !== 'all');
+  showMonitors(); showProfiles();
+  pushPreview();
+  for (const b of document.querySelectorAll('#swatches button')) b.setAttribute('aria-pressed', (values().diskColor || '').toLowerCase() === b.title);
+  $('scopeDesc').textContent = scope === 'all' ? 'Every black hole.' : 'Only this black hole. Anything you change here overrides the global setting for it.';
+  $('reset').textContent = scope === 'all' ? 'Reset to defaults' : 'Use global settings for this black hole';
+  const names = Object.keys(settings.looks || {}).sort();
+  const sel = $('looks'), cur = sel.value;
+  sel.innerHTML = names.length ? names.map(n => `<option>${n.replace(/[<&]/g, c => c === '<' ? '&lt;' : '&amp;')}</option>`).join('') : '<option value="">No saved looks yet</option>';
+  if (names.includes(cur)) sel.value = cur;
+  $('loadLook').disabled = $('deleteLook').disabled = !names.length;
+}
+// Undo: each change remembers what it replaced (a slider drag counts as one change).
+const history = [];
+function remember(patch) {
+  const keys = Object.keys(patch), now = Date.now(), lastH = history[history.length - 1];
+  if (lastH && lastH.scope === scope && now - lastH.at < 700 && keys.every(k => lastH.keys.includes(k))) { lastH.at = now; return; }
+  if (scope === 'all') history.push({ scope, keys, at: now, before: Object.fromEntries(keys.map(k => [k, structuredClone(settings[k])])) });
+  else {
+    const hh = holes.find(x => x.id === scope);
+    const g = Object.fromEntries(keys.filter(k => !lookKeys.includes(k)).map(k => [k, structuredClone(settings[k])]));
+    history.push({ scope, keys, at: now, overrides: structuredClone(hh?.overrides || {}), before: g });
+  }
+  if (history.length > 50) history.shift();
+  $('undoBtn').disabled = false;
+}
+function undo() {
+  const u = history.pop();
+  $('undoBtn').disabled = !history.length;
+  if (!u) return;
+  if (u.scope === 'all') api.send('set-settings', u.before);
+  else {
+    if (Object.keys(u.before).length) api.send('set-settings', u.before);
+    const hh = holes.find(x => x.id === u.scope);
+    if (hh) hh.overrides = u.overrides;
+    api.send('set-hole', u.scope, null);
+    if (Object.keys(u.overrides).length) api.send('set-hole', u.scope, u.overrides);
+    show();
+  }
+}
+$('undoBtn').onclick = undo;
+addEventListener('keydown', e => { if (e.ctrlKey && e.key.toLowerCase() === 'z' && !/^(INPUT|TEXTAREA)$/.test(document.activeElement?.tagName) ) { e.preventDefault(); undo(); } });
+// compact
+function setCompact(on) { document.body.classList.toggle('compact', on); $('compactBtn').setAttribute('aria-pressed', on); }
+$('compactBtn').onclick = () => { const on = !document.body.classList.contains('compact'); setCompact(on); api.send('settings-compact', on); };
+// live preview: a running copy of the black hole, told each new look
+let previewReady = false;
+function pushPreview() {
+  if (!settings || !lookKeys.length) return;
+  const f = $('preview'), v = values(), hh = holes.find(x => x.id === scope);
+  const pet = { ...Object.fromEntries(lookKeys.map(k => [k, v[k]])), fx: v.fx || [], spin: hh?.spin ?? +v.bhSpin, rare: hh?.rare || null, name: hh?.name || '' };
+  if (!previewReady) {
+    previewReady = true;
+    f.src = `index.html?icon=black&bg=grid&size=0.23&tilt=${encodeURIComponent(v.tilt ?? 7)}&pet=${encodeURIComponent(JSON.stringify(pet))}`;
+    f.onload = () => f.contentWindow.postMessage({ type: 'accretion-look', pet }, '*');
+  } else f.contentWindow?.postMessage({ type: 'accretion-look', pet }, '*');
+  $('previewDesc').textContent = scope === 'all' ? 'Live, as you change things.' : `${hh?.name || 'This black hole'}, live, as you change things.`;
+}
+// quick colours
+const SWATCHES = ['#ff280a', '#ff6a1a', '#ffb43c', '#ffd29a', '#f4f1ea', '#9fc4ff', '#5aa0ff', '#a07bff', '#ff4fa0', '#4dffa8'];
+function makeSwatches() { for (const c of SWATCHES) {
+  const b = el('button'); b.style.background = c; b.title = c; b.setAttribute('aria-label', `Disk colour ${c}`);
+  b.onclick = () => { set({ diskColor: c }); };
+  $('swatches').append(b);
+} }
+function set(patch) {
+  remember(patch);
+  const global = Object.fromEntries(Object.entries(patch).filter(([k]) => !lookKeys.includes(k)));
+  if (scope !== 'all' && Object.keys(global).length) { api.send('set-settings', global); patch = Object.fromEntries(Object.entries(patch).filter(([k]) => lookKeys.includes(k))); if (!Object.keys(patch).length) return; }
+  if (scope === 'all') api.send('set-settings', patch);
+  else {
+    const p = Object.fromEntries(Object.entries(patch).filter(([k]) => lookKeys.includes(k)));
+    const h = holes.find(h => h.id === scope);
+    if (h) h.overrides = { ...h.overrides, ...p };
+    api.send('set-hole', scope, p);
+  }
+}
+// Each hole's profile: its name (editable), mood, age, mass, spin and hunger.
+function age(born) {
+  const s = (Date.now() - born) / 1000;
+  return s < 90 ? 'just born' : s < 5400 ? `${Math.round(s / 60)} minutes old` : s < 129600 ? `${Math.round(s / 3600)} hours old` : `${Math.round(s / 86400)} days old`;
+}
+const hungerWord = a => a == null ? '' : a > 0.75 ? 'hungry' : a > 0.45 ? 'peckish' : 'full';
+const KIND = { first: 'First meal', biggest: 'Biggest meal', heaviest: 'Heaviest', oldest: 'Oldest', oddest: 'Oddest', desk: 'From the desktop', words: 'Words', tab: 'A browser tab', model: 'Biggest model', archive: 'Biggest zip' };
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text != null) e.textContent = text; if (cls) e.className = cls; return e; };
+function tree(n) {   // a hole and the holes it was merged from, as nested lists
+  const li = el('li', n.n || '?');
+  if (n.p?.length) { const ul = el('ul'); for (const c of n.p) ul.append(tree(c)); li.append(ul); }
+  return li;
+}
+const openDetails = new Set();
+// Live portraits: each hole rendered as it looks now (main.js draws them off-screen; a couple of seconds each).
+const portraits = new Map(), pendingPortrait = new Set();
+const lookSig = p => JSON.stringify([...lookKeys.map(k => ({ ...settings, ...(p.overrides || {}) })[k]), Math.round((p.spin || 0) * 10)]);
+async function requestPortrait(id, sig) {
+  if (pendingPortrait.has(id + sig)) return;
+  pendingPortrait.add(id + sig);
+  const url = await api.invoke('portrait', id);
+  pendingPortrait.delete(id + sig);
+  if (!url) return;
+  portraits.set(id, { sig, url });
+  for (const img of document.querySelectorAll(`img.portrait[data-hole="${id}"]`)) img.src = url;
+}
+let petsSig = '';
+function showPets() {
+  const box = $('pets');
+  if (box.contains(document.activeElement)) return;   // don't redraw under someone typing a name
+  const sig = JSON.stringify(holes.map(p => [p.id, lookSig(p), p.name, p.mood, p.trait, p.pinned, p.baby, p.parent, p.friends, p.born && age(p.born),
+    p.mass?.toFixed(2), p.spin?.toFixed(2), hungerWord(p.appetite), p.lineage, p.children, p.trophies, p.stats?.eaten]));
+  if (sig === petsSig) return;   // unchanged: keep the page still (and any click in progress)
+  petsSig = sig;
+  box.innerHTML = '';
+  for (const p of holes) {
+    const card = document.createElement('div');
+    card.className = 'card pet';
+    const text = document.createElement('div'); text.className = 'text';
+    const name = document.createElement('input');
+    name.className = 'name'; name.value = p.name || ''; name.maxLength = 40; name.spellcheck = false; name.title = 'Rename';
+    const commit = () => { if (name.value.trim() && name.value.trim() !== p.name) { p.name = name.value.trim(); api.send('rename', p.id, p.name); showScope(); } };
+    name.addEventListener('change', commit);
+    name.addEventListener('keydown', e => { if (e.key === 'Enter') name.blur(); if (e.key === 'Escape') { name.value = p.name; name.blur(); } });
+    const desc = document.createElement('span'); desc.className = 'desc';
+    const ord = n => n + (n === 1 ? 'st' : n === 2 ? 'nd' : n === 3 ? 'rd' : 'th');
+    desc.textContent = [p.rare && `rare: ${p.rare}`, p.trait, p.mood, p.favourite && `loves ${p.favourite}`, p.hobby && `into ${p.hobby}`,
+                        p.fear && `afraid of ${p.fear}`, p.of > 1 && `${ord(p.rank)} of ${p.of} in the pecking order`, p.sulking && 'sulking (feed it to make up)', p.baby && 'baby', p.pinned && 'staying put', p.born && age(p.born), p.mass != null && `${p.mass.toFixed(2)} × starting mass`,
+                        p.spin != null && `spin ${p.spin.toFixed(2)}`, hungerWord(p.appetite)].filter(Boolean).join(' · ');
+    text.append(name, desc);
+    const pic = el('img', null, 'portrait'); pic.alt = '';
+    const sig = lookSig(p);
+    if (portraits.get(p.id)?.sig === sig) pic.src = portraits.get(p.id).url;
+    else requestPortrait(p.id, sig);
+    pic.dataset.hole = p.id;
+    const row = el('div', null, 'row');
+    const edit = el('button', 'Edit look'); edit.onclick = () => { scope = p.id; showScope(); show(); showTab('look'); };
+    const code = el('button', 'Copy share code'); code.onclick = async () => { await api.invoke('share-code', p.id); code.textContent = 'Copied'; setTimeout(() => code.textContent = 'Copy share code', 1500); };
+    const cardBtn = el('button', 'Share card'); cardBtn.onclick = () => { api.send('share-card', p.id); cardBtn.disabled = true; setTimeout(() => cardBtn.disabled = false, 3000); };
+    row.append(edit, code, cardBtn);
+    // Family and the trophy shelf.
+    const det = el('details'); det.open = openDetails.has(p.id);
+    det.addEventListener('toggle', () => det.open ? openDetails.add(p.id) : openDetails.delete(p.id));
+    det.append(el('summary', 'Inside it, family, trophies and gallery'));
+    det.append(el('h3', `Inside it right now · ${p.meals || 0}`));
+    const st = el('div', null, 'stomach'); det.append(st);
+    const loadStomach = async () => {
+      const items = await api.invoke('stomach', p.id);
+      st.innerHTML = '';
+      if (!items.length) st.append(el('div', 'Nothing. Drop a window, a file or some text on it.'));
+      for (const it of items) {
+        const row = el('div', null, 'item'), img = el('img'); img.alt = ''; if (it.thumb) img.src = it.thumb;
+        const b = el('button', 'Spit out'); b.onclick = () => { api.send('spit-one', p.id, it.key); row.remove(); };
+        row.append(img, el('span', it.label, 'label'), el('span', it.quality), b); st.append(row);
+      }
+    };
+    if (p.memory) det.append(el('div', `It dreams about: ${p.memory}`));
+    if (p.favourite) det.append(el('div', `Favourite food: ${p.favourite}`));
+    det.append(el('h3', 'Family'));
+    const fam = [];
+    if (p.parent) fam.push(`Parent: ${p.parent}`);
+    if (p.rivals?.length) fam.push(`Rivals: ${p.rivals.join(', ')}`);
+    if (p.children?.length) fam.push(`Babies: ${p.children.map(c => c.n).join(', ')}`);
+    if (p.friends?.length) fam.push(`Friends: ${p.friends.join(', ')}`);
+    for (const f of fam) det.append(el('div', f));
+    if (p.lineage?.p?.length) { det.append(el('div', 'Merged from:')); const ul = el('ul', null, 'tree'); for (const c of p.lineage.p) ul.append(tree(c)); det.append(ul); }
+    if (!fam.length && !p.lineage?.p?.length) det.append(el('div', 'No family yet.'));
+    det.append(el('h3', `Trophy shelf · ${p.stats?.eaten || 0} eaten`));
+    const tr = (p.trophies || []);
+    if (!tr.length) det.append(el('div', 'Nothing eaten yet.'));
+    for (const t of tr) det.append(el('div', `${KIND[t.kind] || t.kind}: ${t.label}${t.detail ? ` (${t.detail})` : ''}`));
+    // The journal: a day at a time, newest first.
+    det.append(el('h3', 'Journal'));
+    const jr = el('div', null, 'journal'); det.append(jr);
+    const mins = s => s >= 90 ? `${Math.round(s / 60)} minutes` : `${Math.round(s)} seconds`;
+    const loadJournal = async () => {
+      const days = p.uid ? await api.invoke('journal-get', p.uid) : [];
+      jr.innerHTML = '';
+      if (!days.length) jr.append(el('div', 'Nothing written yet. It fills in as the day goes on.'));
+      for (const [date, d] of days.slice(0, 14)) {
+        const parts = [d.ate ? `Ate ${d.ate} thing${d.ate > 1 ? 's' : ''}${d.best ? ` (the biggest: ${d.best})` : ''}.` : 'Ate nothing.',
+                       d.petS > 5 && `Purred for ${mins(d.petS)}.`, d.danceS > 5 && `Danced for ${mins(d.danceS)}.`, d.sleepS > 30 && `Slept for ${mins(d.sleepS)}.`].filter(Boolean);
+        const day = el('div', null, 'day'), b = el('b', new Date(date + 'T12:00').toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' }));
+        day.append(b, el('div', parts.join(' ')));
+        for (const n of d.notes || []) day.append(el('div', n));
+        jr.append(day);
+      }
+    };
+    det.append(el('h3', 'Gallery · a portrait a day'));
+    const gal = el('div', null, 'gallery'); det.append(gal);
+    const loadGallery = async () => {
+      const pics = p.uid ? await api.invoke('gallery', p.uid) : [];
+      gal.innerHTML = '';
+      if (!pics.length) gal.append(el('div', 'The first portrait is taken a minute or two after it appears, then one a day.'));
+      for (const g of pics) { const f = el('figure'), img = el('img'); img.src = g.url; img.alt = `${p.name} on ${g.date}`; f.append(img, el('figcaption', g.date.slice(5))); gal.append(f); }
+    };
+    if (det.open) { loadStomach(); loadGallery(); loadJournal(); }
+    det.addEventListener('toggle', () => { if (det.open) { loadStomach(); loadGallery(); loadJournal(); } });
+    card.append(pic, text, row, det); box.append(card);
+  }
+}
+
+// Achievements, and the looks they unlock.
+let achList = [];
+// Unlockable looks: effects that switch on and off and combine. Each one can be for every hole or just one
+// (the "Applies to" choice, or Edit look on a hole's card). Previews are in looks/ (tools/make-previews.js).
+const UNLOCKS = [
+  ['Effects', [
+    { id: 'jets', name: 'Relativistic jets', needs: 'heavy', desc: 'Beams of plasma shot out along the spin axis at 92% of the speed of light. The one tipped toward you is brighter.' },
+    { id: 'debris', name: 'Debris ring', needs: 'tde', desc: 'What\'s left of a shredded star: a faint, lumpy ring, its streaks wound into a spiral.' },
+    { id: 'photon', name: 'Photon sphere glow', needs: 'spin', desc: 'Light that nearly orbits the hole glows, tracing the lopsided edge of a spinning shadow.' },
+    { id: 'hawking', name: 'Hawking glow', needs: 'week', desc: 'A faint, slowly shifting halo, as if it\'s quietly evaporating.' },
+    { id: 'companion', name: 'Companion star', needs: 'friends', desc: 'A small star in orbit, slowly being stripped: its gas spirals down into the disk.' },
+    { id: 'ripples', name: 'Gravitational wave ripples', needs: 'merger', desc: 'Faint rings run out every few seconds, rippling the desktop, as if it\'s still ringing from a merger.' },
+    { id: 'pixel', name: 'Pixel', needs: 'retro', desc: 'Pixel art, for good.' },
+  ]],
+  ['Disk', [
+    { id: 'spiral', name: 'Spiral arms', needs: 'first', desc: 'Two bright spiral waves turning through the disk.' },
+    { id: 'clumpy', name: 'Clumpy', needs: 'big', desc: 'Hot spots ride round with the gas, flare up and fade.' },
+    { id: 'banded', name: 'Banded', needs: 'baby', desc: 'Sharp rings with gaps between them, like Saturn\'s.' },
+    { id: 'warped', name: 'Warped', needs: 'shaken', desc: 'The disk tips more the further out it goes, and slowly precesses.' },
+    { id: 'magnetic', name: 'Magnetised', needs: 'purr', desc: 'Fine filaments of gas threaded by magnetic field, wound up by the orbit.' },
+  ]],
+  ['Around it', [
+    { id: 'dust', name: 'Dust trail', needs: 'shared', desc: 'A faint wisp of gas trails behind it when it moves.' },
+    { id: 'stars', name: 'Starfield', needs: 'night', desc: 'Distant stars behind it, bent into arcs and doubled by the lens.' },
+    { id: 'snow', name: 'Snow / embers', needs: 'season', desc: 'Specks drift in and spiral down into it: snow in winter, embers the rest of the year.' },
+  ]],
+  ['Strange', [
+    { id: 'glitch', name: 'Glitch', needs: 'self', desc: 'Corrupted: it breaks into blocks and tears, and stutters as it moves.' },
+    { id: 'white', name: 'White hole', needs: 'recycle', desc: 'The reverse. Light pushes outward, the middle blazes white, and anything it\'s fed is flung out.' },
+    { id: 'wormhole', name: 'Wormhole', needs: 'adopted', desc: 'Look into the shadow and see another monitor, as if through the far end of a tunnel.' },
+    { id: 'inverted', name: 'Inverted', needs: 'hundred', desc: 'Gravity pushes instead of pulls: no shadow, and the desktop bulges away from it.' },
+  ]],
+];
+function showAch() {
+  if (!settings) return;
+  const got = settings.achievements || {};
+  $('achCount').textContent = `${Object.keys(got).length} of ${achList.length} earned`;
+  const box = $('achs'); box.innerHTML = '';
+  for (const a of achList) {
+    const c = el('div', null, 'card' + (got[a.id] ? '' : ' locked')), t = el('div', null, 'text');
+    t.append(el('span', got[a.id] || !a.hidden ? a.name : '???', 'title'), el('span', got[a.id] ? `${a.desc} · ${new Date(got[a.id]).toLocaleDateString()}` : a.desc || 'Hidden.', 'desc'));
+    c.append(t); box.append(c);
+  }
+  const ub = $('unlocks'); ub.innerHTML = '';
+  const cur = values().fx || [], h0 = holes.find(h => h.id === scope);
+  $('unlockScope').textContent = scope === 'all' ? 'Switch on as many as you like. These apply to every black hole (choose one under "Applies to", or use Edit look on its card, to give it its own).'
+                                                 : `Just for ${h0?.name || 'this black hole'}. Switch on as many as you like.`;
+  for (const [group, list] of UNLOCKS) {
+    ub.append(el('h3', group));
+    for (const L of list) {
+      const open = !!got[L.needs], a = achList.find(a => a.id === L.needs);
+      const c = el('div', null, 'card' + (open ? '' : ' locked')), t = el('div', null, 'text');
+      const img = el('img'); img.src = `looks/${L.id}.png`; img.alt = '';
+      t.append(el('span', L.name, 'title'), el('span', open ? L.desc : `${L.desc} Earn “${a && (got[a.id] || !a.hidden) ? a.name : '???'}” to unlock.`, 'desc'));
+      const sw = el('label', null, 'switch'), box = el('input'); box.type = 'checkbox'; box.checked = cur.includes(L.id); box.disabled = !open;
+      box.onchange = () => { const now = values().fx || []; set({ fx: box.checked ? [...new Set([...now, L.id])] : now.filter(x => x !== L.id) }); };
+      sw.append(box, el('span'));
+      c.append(img, t, sw); ub.append(c);
+    }
+  }
+  if (pluginLooks.length) {
+    ub.append(el('h3', 'From plugins'));
+    for (const L of pluginLooks) {
+      const c = el('div', null, 'card'), t = el('div', null, 'text');
+      t.append(el('span', L.name, 'title'), el('span', `${L.desc ? L.desc + ' ' : ''}(${L.plugin})`, 'desc'));
+      const b = el('button', 'Use'); b.onclick = () => set(L.look);
+      c.append(t, b); ub.append(c);
+    }
+  }
+}
+// ---------- tabs ----------
+let tab = 'pets';
+try { tab = localStorage.getItem('tab') || 'pets'; } catch { }
+function showTab(t) {
+  tab = t;
+  for (const b of document.querySelectorAll('.tabs button')) { const on = b.dataset.tab === t; b.setAttribute('aria-selected', on); b.tabIndex = on ? 0 : -1; }
+  for (const s of document.querySelectorAll('section.tab')) s.classList.toggle('on', s.dataset.tab === t);
+  $('scopeCard').style.display = (t === 'look' || t === 'unlocks') && (holes.length > 1 || scope !== 'all') ? '' : 'none';
+  try { localStorage.setItem('tab', t); } catch { }
+}
+for (const b of document.querySelectorAll('.tabs button')) b.addEventListener('click', () => showTab(b.dataset.tab));
+$('tabs').addEventListener('keydown', e => {   // arrow keys move between tabs, as in Windows
+  const bs = [...document.querySelectorAll('.tabs button')], i = bs.findIndex(b => b.dataset.tab === tab);
+  const n = e.key === 'ArrowRight' ? i + 1 : e.key === 'ArrowLeft' ? i - 1 : e.key === 'Home' ? 0 : e.key === 'End' ? bs.length - 1 : -2;
+  if (n === -2) return;
+  e.preventDefault();
+  const b = bs[(n + bs.length) % bs.length]; showTab(b.dataset.tab); b.focus();
+});
+// ---------- search: every tab at once, only the matching settings ----------
+$('search').addEventListener('input', () => {
+  const q = $('search').value.trim().toLowerCase();
+  document.body.classList.toggle('searching', !!q);
+  for (const c of document.querySelectorAll('main .card, main dl.keys dt, main dl.keys dd')) c.classList.toggle('search-hidden', !!q && !c.textContent.toLowerCase().includes(q));
+  for (const s of document.querySelectorAll('section.tab')) {
+    for (const h2 of s.querySelectorAll('h2, h3')) {   // a heading shows if anything under it does
+      let n = h2.nextElementSibling, any = false;
+      while (n && !/^H[23]$/.test(n.tagName)) { if (!n.classList.contains('search-hidden') && (n.matches('.card, dl, div') && n.offsetParent !== null || n.querySelector?.('.card:not(.search-hidden)'))) any = true; n = n.nextElementSibling; }
+      h2.classList.toggle('search-hidden', !!q && !any);
+    }
+    s.classList.toggle('search-hidden', !!q && !s.querySelector('.card:not(.search-hidden), dd:not(.search-hidden)'));
+  }
+  if (!q) showTab(tab);
+});
+// ---------- monitors ----------
+let monitors = [];
+function showMonitors() {
+  const box = $('monitors'); if (!box || !settings) return;
+  if (box.contains(document.activeElement)) return;
+  box.innerHTML = '';
+  const rules = settings.monitorRules || {};
+  for (const m of monitors) {
+    const c = el('div', null, 'card'), t = el('div', null, 'text');
+    t.append(el('span', m.label, 'title'), el('span', `${m.detail}. Black holes ${rules[m.id]?.allow === false ? 'stay off' : 'can go on'} this monitor.`, 'desc'));
+    const sw = el('label', null, 'switch'), box2 = el('input'); box2.type = 'checkbox'; box2.checked = rules[m.id]?.allow !== false;
+    box2.setAttribute('aria-label', `Allow black holes on ${m.label}`);
+    box2.onchange = () => set({ monitorRules: { ...(settings.monitorRules || {}), [m.id]: { allow: box2.checked } } });
+    sw.append(box2, el('span')); c.append(t, sw); box.append(c);
+  }
+}
+// ---------- profiles ----------
+let profileNames = [];
+function showProfiles() {
+  const sel = $('profiles'); if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = profileNames.length ? profileNames.map(n => `<option>${n.replace(/[<&]/g, c => c === '<' ? '&lt;' : '&amp;')}</option>`).join('') : '<option value="">No profiles yet</option>';
+  if (profileNames.includes(cur)) sel.value = cur;
+  $('loadProfile').disabled = $('deleteProfile').disabled = !profileNames.length;
+}
+const profile = async (op, name) => { profileNames = await api.invoke('profile', op, name); showProfiles(); };
+$('saveProfile').onclick = () => { const n = $('profileName').value.trim(); if (n) { profile('save', n); $('profileName').value = ''; } };
+$('loadProfile').onclick = () => profile('load', $('profiles').value);
+$('deleteProfile').onclick = () => profile('delete', $('profiles').value);
+// ---------- backup ----------
+$('exportAll').onclick = async () => { const r = await api.invoke('export-all'); if (r.ok) $('backupMsg').textContent = `Saved to ${r.file}`; };
+$('importAll').onclick = async () => {
+  const r = await api.invoke('import-all');
+  if (r.error) $('backupMsg').textContent = r.error;
+  else if (r.ok) $('backupMsg').textContent = `Imported: settings${r.pets ? ` and ${r.pets} black hole${r.pets > 1 ? 's' : ''}` : ''}.`;
+};
+$('resetAll').onclick = () => api.send('reset-settings');
+// ---------- breeding ----------
+function showBreedPicks() {
+  for (const id of ['breedPickA', 'breedPickB']) {
+    const sel = $(id), cur = sel.value;
+    sel.innerHTML = '<option value="">A share code…</option>' + holes.map(h => `<option value="hole:${h.id}">${(h.name || '').replace(/</g, '&lt;')}</option>`).join('');
+    if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+    $(id.replace('Pick', '')).style.display = sel.value ? 'none' : '';
+  }
+}
+for (const id of ['breedPickA', 'breedPickB']) $(id).addEventListener('change', showBreedPicks);
+$('breedBtn').onclick = async () => {
+  const pa = $('breedPickA').value || $('breedA').value.trim(), pb = $('breedPickB').value || $('breedB').value.trim();
+  if (!pa || !pb) { $('breedMsg').textContent = 'Choose two parents first.'; return; }
+  if (pa === pb) { $('breedMsg').textContent = 'It takes two different parents.'; return; }
+  const r = await api.invoke('breed', pa, pb);
+  $('breedMsg').textContent = r.error || `${r.name} was born.`;
+};
+// ---------- accessibility: every control gets the name of its setting ----------
+function labelControls() {
+  for (const c of document.querySelectorAll('.card')) {
+    const title = c.querySelector('.title')?.textContent;
+    for (const ctl of c.querySelectorAll('input, select')) if (title && !ctl.getAttribute('aria-label')) ctl.setAttribute('aria-label', title);
+  }
+}
+
+$('showTour').onclick = () => api.send('show-tour');
+// Updates
+function showUpdate(u) {
+  const say = { dev: 'Running from source: updates come from git instead.', unset: 'Updates aren\'t set up in this build yet.', idle: 'Not checked yet.',
+                checking: 'Checking…', current: 'You have the latest version.', downloading: `Downloading ${u.version || 'the new version'}… ${u.percent ? u.percent + '%' : ''}`,
+                ready: `Version ${u.version} is ready. It installs when you quit, or restart now.`, error: `Couldn't check: ${u.error}` };
+  $('updateState').textContent = say[u.state] || u.state;
+  $('installUpdate').hidden = u.state !== 'ready';
+  $('checkUpdate').disabled = u.state === 'checking' || u.state === 'downloading' || u.state === 'dev' || u.state === 'unset';
+}
+api.on('update', showUpdate);
+api.invoke('update-state').then(showUpdate);
+$('checkUpdate').onclick = async () => showUpdate(await api.invoke('update-check'));
+$('installUpdate').onclick = () => api.send('update-install');
+// About, crash reports, plugins
+api.invoke('about').then(a => {
+  $('aboutLine').textContent = `Version ${a.version}. Electron ${a.electron}, Chromium ${a.chrome}, Windows ${a.windows}.`;
+  const box = $('changelog');
+  for (const v of a.changelog) {
+    box.append(el('h4', `${v.version} · ${v.title}`));
+    const ul = el('ul'); for (const it of v.items) ul.append(el('li', it)); box.append(ul);
+  }
+});
+api.invoke('crash-reports').then(r => { $('crashLine').textContent = r.length ? `${r.length} saved on this PC, the latest from ${r[0].slice(0, 10)}. Nothing is ever sent anywhere.` : 'None so far. If something goes wrong, a report is saved on this PC; nothing is ever sent anywhere.'; });
+$('openCrashes').onclick = () => api.send('open-folder', 'crashes');
+$('openLogs').onclick = () => api.send('open-folder', 'logs');
+$('openPlugins').onclick = () => api.send('open-folder', 'plugins');
+$('reloadPlugins').onclick = () => { api.send('reload-plugins'); setTimeout(loadPluginInfo, 300); };
+let pluginLooks = [];
+async function loadPluginInfo() {
+  const p = await api.invoke('plugins');
+  pluginLooks = p.looks;
+  $('pluginLine').textContent = (p.files.length ? `Loaded: ${p.files.join(', ')}.` : 'None yet. Put .json files in the folder (there\'s an example) and press Reload.')
+    + (p.errors.length ? ` Couldn't read: ${p.errors.join('; ')}` : '');
+  showAch();
+}
+loadPluginInfo();
+$('runTest').onclick = async () => {
+  const b = $('runTest'), box = $('results');
+  b.disabled = true; b.textContent = 'Running…'; box.innerHTML = '';
+  const results = await api.invoke('self-test');
+  for (const r of results) {
+    const row = el('div', null, 'result'), mark = el('span', { pass: '✓', warn: '!', fail: '×' }[r.state], 'mark ' + r.state), t = el('div');
+    mark.setAttribute('aria-label', { pass: 'Passed', warn: 'Warning', fail: 'Failed' }[r.state]);
+    t.append(el('b', r.name), el('span', r.detail, 'd'));
+    row.append(mark, t); box.append(row);
+  }
+  b.disabled = false; b.textContent = 'Run again';
+};
+
+async function refreshAch() { achList = await api.invoke('achievements'); showAch(); }
+$('importBtn').addEventListener('click', async () => {
+  const r = await api.invoke('import-code', $('importCode').value);
+  $('importMsg').textContent = r.error || `${r.name} is on your desktop now.`;
+  if (r.ok) $('importCode').value = '';
+});
+function showScope() {
+  showPets();
+  const sel = $('scope');
+  sel.innerHTML = '<option value="all">All black holes</option>' +
+    holes.map((h, i) => `<option value="${h.id}">${(h.name || `Black hole ${i + 1}`).replace(/</g, '&lt;')}${h.meals ? ` (${h.meals} window${h.meals > 1 ? 's' : ''} inside)` : ''}</option>`).join('');
+  if (scope !== 'all' && !holes.some(h => h.id === scope)) scope = 'all';
+  sel.value = String(scope);
+  showTab(tab);
+}
+
+for (const id of RANGES) $(id).addEventListener('input', () => { paint($(id)); set({ [id]: +$(id).value }); });
+for (const id of SWITCHES) $(id).addEventListener('change', () => set({ [id]: $(id).checked }));
+for (const id of SELECTS) $(id).addEventListener('change', () => set({ [id]: $(id).value }));
+$('diskColor').addEventListener('input', e => set({ diskColor: e.target.value }));
+$('scope').addEventListener('change', e => { scope = e.target.value === 'all' ? 'all' : +e.target.value; show(); });
+$('reset').addEventListener('click', () => { if (scope === 'all') api.send('reset-settings'); else { const h = holes.find(h => h.id === scope); if (h) h.overrides = {}; api.send('set-hole', scope, null); show(); } });
+
+// Saved looks
+$('saveLook').addEventListener('click', () => {
+  const name = $('lookName').value.trim();
+  if (!name) { $('lookName').focus(); return; }
+  const v = values();
+  api.send('set-settings', { looks: { ...(settings.looks || {}), [name]: Object.fromEntries(lookKeys.map(k => [k, v[k]])) } });
+  $('lookName').value = '';
+  setTimeout(() => { $('looks').value = name; }, 50);
+});
+$('loadLook').addEventListener('click', () => { const l = settings.looks?.[$('looks').value]; if (l) set(l); });
+$('deleteLook').addEventListener('click', () => {
+  const looks = { ...(settings.looks || {}) };
+  delete looks[$('looks').value];
+  api.send('set-settings', { looks });
+});
+
+api.on('settings', s => { settings = s; show(); refreshAch(); });
+api.on('holes', h => { holes = h; showScope(); showBreedPicks(); if (scope !== 'all') show(); showTab(tab); });
+api.on('scope', s => { scope = s; showScope(); show(); if (s !== 'all') showTab('look'); });
+api.on('stats', s => { $('readout').textContent = `${s.fps} fps · ${s.cpu.toFixed(1)}% CPU`; });
+Promise.all([api.invoke('get-settings'), api.invoke('get-holes'), api.invoke('look-keys'), api.invoke('max-hz'), api.invoke('accent'), api.invoke('shortcuts')])
+  .then(([s, h, keys, hz, accent, shortcuts]) => {
+    settings = s; holes = h; lookKeys = keys;
+    refreshAch();
+    api.invoke('monitors').then(m => { monitors = m; showMonitors(); });
+    profile('list');
+    showBreedPicks(); labelControls(); showTab(tab);
+    setCompact(!!s.compactSettings);
+    makeSwatches();
+    document.documentElement.style.setProperty('--accent', '#' + accent.slice(0, 6));
+    $('captureRate').max = hz;
+    $('rateDesc').textContent = `How often the bent desktop behind the black hole updates, up to your display's ${hz} Hz. ` +
+      `The black hole itself always animates at the display's rate. Lower uses less CPU.`;
+    $('keys').insertAdjacentHTML('beforeend', shortcuts.map(([k, w]) => `<dt>${k.replace(/\+/g, ' + ')}</dt><dd>${w}</dd>`).join(''));
+    showScope(); show();
+  });
+</script>
+</body>
+</html>

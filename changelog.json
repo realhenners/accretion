@@ -1,0 +1,49 @@
+[
+  { "version": "0.9.0", "date": "2026-11-15", "title": "Pets with lives of their own", "items": [
+    "Disk winds lift off the disk, stronger the more it eats; light echoes ripple out after a flare",
+    "Fears and hobbies, jealousy, a pecking order, herds of friends, grooming",
+    "Shake it upside down and things fall out of its stomach",
+    "Ctrl + drag draws a path for it to follow, eating what the path runs into",
+    "Sound that follows where the holes are, up and down as well as left and right; dreams have their own sound",
+    "Portraits and share cards show each black hole exactly as it looks",
+    "About page, local crash reports, and a plugins folder for your own looks and foods",
+    "A few new secrets"
+  ] },
+  { "version": "0.8.0", "date": "2026-11-15", "title": "Getting to know it", "items": [
+    "A welcome tour, undo for meals (Ctrl+Alt+Z) and a journal for each black hole",
+    "It eats pictures, 3D models (as wireframes) and zip files (which burst open)",
+    "Moods change what it will eat; favourite foods; rivalries",
+    "A self-test that checks every part and explains what's wrong"
+  ] },
+  { "version": "0.7.0", "date": "2026-11-15", "title": "A real app", "items": [
+    "An installer with Start menu and desktop shortcuts",
+    "Settings in tabs, with search, profiles, per-monitor rules, backup and accessibility options",
+    "Self-shadowing disks, colour grades, Doppler colour, frame dragging, tides that scale with mass",
+    "Faster: the outer lens is worked out directly, effects compile only when used, smarter screen capture",
+    "Eddington limit, sulking, yawns, hiccups, dreams, rare traits, breeding, meal stealing, a daily gallery",
+    "It eats text, links and browser tabs; food quality; a stomach view",
+    "Sonification sound theme, a watchdog that brings everything back after a crash"
+  ] },
+  { "version": "0.6.0", "date": "2026-11-15", "title": "Unlockable looks", "items": [
+    "Jets, debris rings, photon sphere glow, Hawking glow, a companion star, gravitational wave ripples",
+    "Spiral, clumpy, banded, warped and magnetised disks; dust trails, starfields, snow and embers",
+    "Glitch, white hole, wormhole and inverted black holes",
+    "Previews in Settings, effects that combine, and looks for each black hole"
+  ] },
+  { "version": "0.5.0", "date": "2026-11-15", "title": "Social", "items": [
+    "Share codes and share cards, babies, friendships, achievements, a trophy shelf, a family tree",
+    "Petting, traits picked at birth, dancing to music on the PC, quiet while you type, parking for fullscreen apps"
+  ] },
+  { "version": "0.4.0", "date": "2026-11-14", "title": "A pet", "items": [
+    "Names, moods, hunger, age and mass kept between launches; spin builds up as it eats",
+    "Lens-only rendering and automatic resolution"
+  ] },
+  { "version": "0.3.0", "date": "2026-11-14", "title": "Feeding", "items": [
+    "It eats windows, desktop icons and files, and spits them back out",
+    "Binary inspirals with a real chirp, tidal disruptions, mergers with recoil, easter eggs"
+  ] },
+  { "version": "0.1.0", "date": "2026-11-13", "title": "The first black hole", "items": [
+    "A ray-traced, spinning black hole that bends your real desktop, on every monitor",
+    "Drag, throw, scroll to change its mass; it evaporates when you close it"
+  ] }
+]

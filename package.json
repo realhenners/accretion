@@ -1,0 +1,81 @@
+{
+  "name": "accretion",
+  "version": "0.9.0",
+  "productName": "Accretion",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis --publish never",
+    "release": "electron-builder --win nsis --publish always"
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^26.0.12"
+  },
+  "description": "A desktop pet black hole that bends your screen and eats your windows (visually).",
+  "author": "Accretion",
+  "build": {
+    "appId": "app.accretion.desktop",
+    "productName": "Accretion",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "contents.js",
+      "preload.js",
+      "index.html",
+      "settings.html",
+      "rename.html",
+      "tour.html",
+      "card.html",
+      "icon.png",
+      "icon.ico",
+      "looks/**",
+      "package.json",
+      "changelog.json",
+      "LICENSE",
+      "PRIVACY.md"
+    ],
+    "extraResources": [
+      {
+        "from": "build/capture",
+        "to": "capture"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Accretion",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "henners",
+        "repo": "accretion",
+        "releaseType": "draft"
+      }
+    ]
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "license": "GPL-3.0-or-later"
+}

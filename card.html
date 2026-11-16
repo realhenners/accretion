@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Accretion card</title>
+<style>
+  /* A share card, rendered off-screen by main.js (shareCard) and saved as a picture. */
+  html, body { margin: 0; width: 760px; height: 400px; overflow: hidden; background: #0d0b0a; color: #f2ece4;
+               font: 14px/20px "Segoe UI Variable Text", "Segoe UI", sans-serif; }
+  .card { display: flex; height: 100%; }
+  .portrait { width: 400px; height: 400px; flex: none; background: #000 center / cover no-repeat; position: relative; }
+  .portrait::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent 70%, #0d0b0a); }
+  .info { flex: 1; padding: 34px 32px 26px 8px; display: flex; flex-direction: column; min-width: 0; }
+  h1 { font: 600 30px/36px "Segoe UI Variable Display", "Segoe UI", sans-serif; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sub { color: #b9ada0; margin: 4px 0 20px; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 18px; margin: 0 0 18px; }
+  dt { color: #9c9086; } dd { margin: 0; font-variant-numeric: tabular-nums; }
+  .shelf { color: #d7cdc2; font-size: 13px; line-height: 19px; }
+  .shelf div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .shelf span { color: #9c9086; }
+  .foot { margin-top: auto; color: #8a7f76; font-size: 12px; display: flex; justify-content: space-between; gap: 12px; }
+  .foot b { color: #e9643a; font-weight: 600; letter-spacing: 0.04em; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="portrait" id="portrait"></div>
+  <div class="info">
+    <h1 id="name"></h1>
+    <div class="sub" id="sub"></div>
+    <dl id="facts"></dl>
+    <div class="shelf" id="shelf"></div>
+    <div class="foot"><b>ACCRETION</b><span id="ach"></span></div>
+  </div>
+</div>
+<script>
+const KIND = { biggest: 'Biggest meal', heaviest: 'Heaviest', oldest: 'Oldest', oddest: 'Oddest', desk: 'From the desktop' };
+window.app.on('card', d => {
+  const $ = id => document.getElementById(id);
+  $('portrait').style.backgroundImage = `url(${d.portrait})`;
+  $('name').textContent = d.name;
+  $('sub').textContent = [d.trait, d.mood, d.family].filter(Boolean).join(' · ');
+  for (const [k, v] of [['Age', d.age], ['Mass', `${d.mass} × starting mass`], ['Spin', d.spin], ['Eaten', `${d.eaten} thing${d.eaten === 1 ? '' : 's'}`]]) {
+    const dt = document.createElement('dt'), dd = document.createElement('dd');
+    dt.textContent = k; dd.textContent = v; $('facts').append(dt, dd);
+  }
+  for (const t of d.trophies) {
+    const row = document.createElement('div'), s = document.createElement('span');
+    s.textContent = `${KIND[t.kind] || t.kind}: `;
+    row.append(s, `${t.label}${t.detail ? ` (${t.detail})` : ''}`);
+    $('shelf').append(row);
+  }
+  $('ach').textContent = d.achievements;
+});
+</script>
+</body>
+</html>

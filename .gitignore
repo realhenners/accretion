@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Built output (all made from the source in this repository)
+dist/
+build/
+capture/
+capture-helper/bin/
+capture-helper/obj/
+
+# Private release notes
+RELEASING.md
+
+# Logs and editor clutter
+*.log
+.vs/
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,3162 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Accretion</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  body.grab { cursor: grab; }
+  body.dragging { cursor: grabbing; }
+  .toast { position: fixed; transform: translate(-50%, 0); text-align: center; pointer-events: none; opacity: 0;
+           transition: opacity 0.9s ease; color: #f4efe8; text-shadow: 0 0 12px rgba(0,0,0,0.85), 0 0 2px rgba(0,0,0,0.9);
+           font: 300 28px/1.2 "Segoe UI Variable Display", "Segoe UI", sans-serif; letter-spacing: 0.02em; white-space: nowrap; }
+  .toast small { display: block; font-size: 15px; opacity: 0.75; margin-top: 6px; letter-spacing: 0.04em; }
+  .toast.on { opacity: 1; }
+  #fx2d, #ui2d { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  /* Hover a hole for a moment: a small tag with how it's feeling. */
+  .moodtag { position: fixed; pointer-events: none; opacity: 0; transition: opacity 0.4s ease; white-space: nowrap;
+             font: 12px/16px "Segoe UI Variable Text", "Segoe UI", sans-serif; color: rgba(244,239,232,0.9);
+             background: rgba(18,14,12,0.6); border-radius: 10px; padding: 3px 9px; letter-spacing: 0.02em; }
+  .moodtag b { font-weight: 400; opacity: 0.8; margin: 0 5px 0 7px; }
+  .moodtag .nm { font-weight: 600; }
+  body.ontag .moodtag .nm { text-decoration: underline; }
+  body.ontag { cursor: text; }
+  .moodtag.on { opacity: 1; }
+  /* Settings -> Accessibility -> Larger labels: bigger, higher-contrast text. */
+  body.large .moodtag { font-size: 16px; line-height: 22px; padding: 5px 12px; color: #fff; background: rgba(0,0,0,0.88); }
+  body.large .toast { font-size: 30px; text-shadow: 0 0 4px #000, 0 0 2px #000, 0 0 16px #000; }
+  body.large .toast small { font-size: 19px; opacity: 1; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<canvas id="fx2d"></canvas>
+<canvas id="ui2d"></canvas>
+<div class="toast" id="toast"></div>
+<div class="moodtag" id="moodtag"></div>
+<script>
+// One of these pages runs on every monitor. One of them (the "leader") runs the physics for every black hole and
+// sends the result to the others; all of them draw whatever part of the scene falls on their monitor.
+// Positions are in physical screen pixels across all monitors, so a hole straddling two monitors with different
+// display scaling still lines up at the seam. The same page also renders the share view and the app icon.
+
+const MAXH = 4;          // most black holes drawn at once
+const K = 600 / 28;      // px per Schwarzschild radius at mass 1, size 1, 100% scaling
+const LENS = 25.2;       // lensed area radius, in Schwarzschild radii
+const EVAPORATE = 3.4, BURST = 1.2, FADE = 0.9, BORN = 0.6;   // seconds; keep DEATH_MS in main.js in step
+const MEAL_TIME = 2.6;   // seconds for a swallowed window to fall in
+const TDE_TIME = 9;      // seconds a tidal disruption lasts
+const EAT_HOLD = 1000;   // ms the hole must be held still over a window before letting go feeds it the window
+// Icon mode (also the share-card portrait) renders a hole and must not talk to the app.
+const api = new URLSearchParams(location.search).has('icon') ? { ...(window.app || {}), send: () => {}, on: window.app ? window.app.on : () => {} } : window.app;
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { premultipliedAlpha: true, alpha: true, antialias: false });
+const floatTargets = !!gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('OES_texture_float_linear');
+
+// =====================================================================================================
+//  Shaders
+// =====================================================================================================
+const VS = `#version 300 es
+in vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }`;
+
+const SCENE_FS = `#version 300 es
+precision highp float;
+layout(location = 0) out vec4 outColor;    // premultiplied colour
+layout(location = 1) out vec4 outBright;   // linear light, for the bloom
+#define MAXH ${MAXH}
+uniform int uN;
+uniform vec4 uA[MAXH];   // centre x, y (device px, y up), Schwarzschild radius px (at full mass), evaporation mass 0..1
+uniform vec4 uB[MAXH];   // disk inclination, roll, Hawking glow on 0..1, seconds into the final burst (-1 before)
+uniform vec4 uC[MAXH];   // opacity 0..1, seconds since fed (-1), seconds since a merger (-1), base Schwarzschild radius px
+uniform vec4 uD[MAXH];   // disk colour (absorption-style coefficients rgb), heat
+uniform vec4 uE[MAXH];   // spin a/M, ISCO (Rs), horizon (Rs), disk thickness H/r
+uniform vec4 uF[MAXH];   // disk outer radius (Rs), disk opacity, disk on, orbit speed
+uniform vec4 uG[MAXH];   // seconds into a tidal disruption (-1), Einstein-ring star brightness, hunger glow, 0
+uniform float uTime;
+uniform vec2 uRes;            // device px of this render target
+uniform float uPxScale;       // render px per screen px (share view draws a whole monitor into a smaller window)
+uniform sampler2D uScreen;    // BGRA desktop capture around the holes, rows top-down, mipmapped
+uniform vec2 uWinOrigin;      // this view's top-left on screen, physical px
+uniform vec2 uCapOrigin;      // captured region's top-left on screen, physical px
+uniform vec2 uCapSize;
+uniform bool uHasScreen, uShare;
+uniform vec3 uFlatBg;         // what's "behind" when there's no capture (app icon)
+uniform sampler2D uMeal;      // swallowed windows falling in (premultiplied, render px): part of what's behind
+uniform bool uHasMeal;
+uniform vec2 uJitter;         // sub-pixel offset, different every frame (temporal anti-aliasing)
+uniform vec4 uH[MAXH];        // look extras: effect bits (FX_* below), glitch forced on (previews), colour grade, Doppler colour 0..1
+uniform float uStep;          // ray step scale: 1 = full quality, more = fewer, longer steps
+uniform vec4 uI[MAXH];        // dreaming 0..1, disk wind strength, being groomed 0..1, film look (no beaming) 0/1
+uniform vec4 uJ[MAXH];        // lined up with another hole 0..1, corona 0..1, casts a shadow 0/1, 0
+uniform sampler2D uDream;     // each hole's memory of the biggest thing it ate, side by side (128x80 each, BGRA)
+uniform sampler2D uWorm;      // wormhole: another monitor, seen through the shadow (BGRA, rows top-down)
+uniform bool uHasWorm;
+// Unlockable effects, one bit each (index.html FX keeps the same order).
+#define FX_JETS 1
+#define FX_DEBRIS 2
+#define FX_PHOTON 4
+#define FX_HAWKING 8
+#define FX_COMP 16
+#define FX_RIPPLES 32
+#define FX_SPIRAL 128
+#define FX_CLUMPY 256
+#define FX_BANDED 512
+#define FX_WARPED 1024
+#define FX_MAGNETIC 2048
+#define FX_GLITCH 4096
+#define FX_WHITE 8192
+#define FX_WORM 16384
+#define FX_INVERT 32768
+#define FX_STARS 131072
+// FXMASK (prepended when compiling) is the set of effects any hole uses right now; everything else compiles away.
+bool has(int i, int f){ return (FXMASK & f) != 0 && (int(uH[i].x) & f) != 0; }
+
+const float LENS = ${LENS.toFixed(2)};
+const float BG = 19.1;        // depth of the desktop "behind" the hole, in base Schwarzschild radii (sets the Einstein ring)
+// Within this many M of a hole, light follows the exact Kerr equations. Far enough out that the hand-off to and from
+// the weak-field formula is seamless (Boyer-Lindquist coordinates differ from flat space by ~2M/r: 5% here).
+const float ZONE = 40.0;
+
+float hash(vec3 p){ p = fract(p*0.3183099 + 0.1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+float noise(vec3 x){
+  vec3 i = floor(x), f = fract(x); f = f*f*(3.0-2.0*f);
+  return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x), mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x), f.y),
+             mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x), mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x), f.y), f.z);
+}
+float fbm(vec3 p){ float a = 0.5, s = 0.0; for(int i=0;i<3;i++){ s += a*noise(p); p *= 2.03; a *= 0.5; } return s / 0.875; }
+
+// Blackbody colour for a temperature in kelvin (Tanner Helland's fit to the Planck locus, normalised to 0..1).
+vec3 kelvin(float K){
+  float t = clamp(K, 1000.0, 40000.0) / 100.0;
+  vec3 c;
+  c.r = t <= 66.0 ? 1.0 : 1.2929362 * pow(t - 60.0, -0.1332048);
+  c.g = t <= 66.0 ? 0.3900816 * log(t) - 0.6318414 : 1.1298909 * pow(t - 60.0, -0.0755148);
+  c.b = t >= 66.0 ? 1.0 : (t <= 19.0 ? 0.0 : 0.5432068 * log(t - 10.0) - 1.1962541);
+  return clamp(c, 0.0, 1.0);
+}
+
+// Direction -> deflection angle as a 2D vector (equidistant). Stays finite for light bent backwards.
+vec2 deflection(vec3 d){
+  float l = length(d.xy);
+  return l > 1e-6 ? d.xy / l * acos(clamp(d.z, -1.0, 1.0)) : vec2(0);
+}
+
+// ---------- the accretion disk ----------
+// Surface brightness of hole i's disk at hp (its own frame, disk in xz, Schwarzschild radii) for light heading
+// along rd (same frame). order = how many times this ray has crossed this disk (2+ = light that looped the hole).
+vec3 diskB(int i, vec3 hp, vec3 rd, float order){   // brightness, opacity, Doppler factor
+  float m = uA[i].w, isco = uE[i].y, outer = uF[i].x, omega = uF[i].w;
+  // As the hole loses mass, each ring of gas keeps its angular momentum; a circular orbit with fixed angular
+  // momentum sits at r ~ 1/M, so the disk swells outward and thins (surface density ~ M^2).
+  float rAct = length(hp.xz);
+  float rr = rAct * m;
+  if (m <= 0.0 || rr < isco*0.9 || rr > outer * 1.6) return vec3(0, 0, 1);
+  float a0 = atan(hp.z, hp.x);
+  float b = 0.0, tau = 0.0;
+  if (uF[i].z > 0.5 && rr < outer) {
+    // Keplerian orbit: angular speed falls off as r^-1.5, so the inner disk laps the outer disk and the gas shears
+    // into trailing spirals. Two copies of the pattern restart on a cycle and cross-fade, so it never winds up.
+    const float CYCLE = 6.0;
+    float w = omega / pow(rr, 1.5);
+    float f = fract(uTime / CYCLE);
+    float aA = a0 - w * f * CYCLE, aB = a0 - w * fract(f + 0.5) * CYCLE;
+    float nA = fbm(vec3(rr*2.2, cos(aA)*2.4, sin(aA)*2.4));
+    float nB = fbm(vec3(rr*2.2 + 7.3, cos(aB)*2.4, sin(aB)*2.4));
+    float xf = 1.0 - abs(2.0*f - 1.0);
+    float n = mix(nB, nA, xf);
+    float rings = 0.55 + 0.45*sin(rr*18.0 + n*9.0);
+    // Light that looped the hole squeezes the whole disk into a hairline ring; fine detail there only sparkles.
+    float soft = clamp(order - 1.0, 0.0, 1.0) * 0.85;
+    n = mix(n, 0.5, soft); rings = mix(rings, 0.55, soft);
+    n = mix(n, 0.62, 0.6 * uI[i].z); rings = mix(rings, 0.75, 0.5 * uI[i].z);   // groomed: combed smooth
+    // Spin moves the inner edge (ISCO) inward, and the inner disk is hotter.
+    float profile = smoothstep(isco*0.95, isco*1.15, rr) * min(pow(3.3/rr, 1.8), 3.0) * (1.0 - smoothstep(outer*0.57, outer, rr));
+    // Disk styles (unlockable, and they combine).
+    float style = 1.0, tstyle = 1.0;
+    if (has(i, FX_SPIRAL)) {     // two-armed density wave: a logarithmic spiral turning slowly as a pattern
+      float arm = 0.5 + 0.5 * cos(2.0 * (a0 - 0.2 * omega * uTime) + 3.2 * log(rr));
+      style *= 0.3 + 1.6 * arm * arm * arm; tstyle *= 0.5 + arm;
+    }
+    if (has(i, FX_BANDED)) {     // sharp rings with clear gaps, like Saturn's
+      float bd = smoothstep(-0.25, 0.25, sin(rr * 5.5 + 0.7));
+      style *= 0.08 + 1.4 * bd; tstyle *= 0.04 + bd;
+    }
+    if (has(i, FX_MAGNETIC)) {   // fine filaments of gas threaded by magnetic field, wound up by the orbit
+      float fA = 1.0 - abs(2.0 * noise(vec3(rr * 16.0, cos(aA) * 1.5, sin(aA) * 1.5)) - 1.0);
+      float fB = 1.0 - abs(2.0 * noise(vec3(rr * 16.0 + 3.1, cos(aB) * 1.5, sin(aB) * 1.5)) - 1.0);
+      float fl = pow(mix(fB, fA, xf), 6.0);
+      style *= 0.3 + 2.2 * fl;
+    }
+    b = profile * (0.35 + 0.65*n*rings) * 2.2 * uD[i].w * (1.0 + 0.6 * uG[i].z) * style;
+    if (uI[i].x > 0.0) {   // dreaming: a ghost of the biggest thing it ever ate, wound round the disk with the gas
+      float du = fract((a0 - 0.3 * omega / pow(rr, 1.5) * uTime) / 3.14159);
+      float dv = clamp((rr - isco * 1.2) / (outer * 0.75 - isco * 1.2), 0.0, 1.0);
+      vec3 im = texture(uDream, vec2((float(i) + du) / 4.0, 1.0 - dv)).bgr;
+      b += dot(im, vec3(0.3, 0.5, 0.2)) * profile * 2.2 * uI[i].x * uD[i].w;
+    }
+    tau = profile * 1.6 * tstyle;   // how much the gas blocks light: its smooth density, not its glow
+    if (has(i, FX_CLUMPY)) {     // hot spots that orbit with the gas, flare up and fade
+      for (int j = 0; j < 6; j++) {
+        float fj = float(j);
+        float rj = mix(isco * 1.4, outer * 0.5, fract(fj * 0.618 + 0.15));
+        float ph = fj * 2.39 + omega / pow(rj, 1.5) * uTime;
+        float life = 0.5 - 0.5 * cos(uTime * (0.35 + 0.11 * fj) + fj * 1.7);
+        float dd = atan(sin(a0 - ph), cos(a0 - ph));
+        b += exp(-((rr - rj) * (rr - rj) / 0.35 + (rr * dd) * (rr * dd) / 0.9)) * 9.0 * life * life * uD[i].w;
+      }
+    }
+    // Fed: a clump of gas falls in along a tightening spiral, then the inner disk flares as it reaches the ISCO.
+    float feed = uC[i].y;
+    if (feed >= 0.0) {
+      float tf = clamp(feed / 1.6, 0.0, 1.0);
+      float rf = mix(outer*0.8, isco*1.05, pow(tf, 1.5));
+      float af = 1.3 + omega * 0.8 * feed * feed;
+      float da = atan(sin(a0 - af), cos(a0 - af));
+      float d2 = (rr - rf)*(rr - rf) + (rr*da)*(rr*da)*0.12;
+      b += exp(-d2 / 0.5) * 2.5 * (1.0 - smoothstep(1.4, 1.6, feed)) * uD[i].w;
+      if (feed > 1.5) b *= 1.0 + 2.5 * exp(-(feed - 1.5)/0.7) * exp(-(rr - isco)/2.5);
+      // Light echo: that flare's light reaches the outer disk later (it's further away), lighting a ring running outward.
+      if (feed > 1.5) b *= 1.0 + 1.6 * exp(-pow((rr - isco - 7.0 * (feed - 1.5)) / 1.1, 2.0)) * exp(-(feed - 1.5) / 1.4);
+    }
+  }
+  if (has(i, FX_DEBRIS)) {   // what's left of a shredded star: a faint, lumpy ring, its streaks wound into a spiral
+    float rd = outer * 1.2, wd = outer * 0.15;
+    if (abs(rr - rd) < wd * 2.5) {
+      float ad = a0 - omega / pow(rd, 1.5) * uTime * 0.5 + (rr - rd) * 0.9;
+      float lump = fbm(vec3(cos(ad) * 3.0, sin(ad) * 3.0, rr * 0.6));
+      float ring = exp(-pow((rr - rd) / wd, 2.0));
+      b += ring * smoothstep(0.35, 0.8, lump) * 1.5 * uD[i].w;
+      tau += ring * smoothstep(0.3, 0.8, lump) * 0.6;
+    }
+  }
+  if (has(i, FX_COMP)) {     // gas pulled off the companion star runs ahead of it, spiralling down into the disk
+    float phs = uTime * 6.2832 / 40.0 + float(i) * 2.1, rc = outer * 1.45;
+    float u = atan(sin(a0 - phs), cos(a0 - phs));
+    if (u > 0.0 && u < 2.6) {
+      float rS = mix(rc * 0.96, outer * 0.75, u / 2.6), ws = 0.1 + 0.12 * u;
+      b += exp(-pow((rr - rS) / ws, 2.0)) * (1.0 - u / 2.6) * 2.0 * uD[i].w;
+      tau += exp(-pow((rr - rS) / ws, 2.0)) * 0.3;
+    }
+  }
+  // Tidal disruption: a star on a near-parabolic orbit comes in, is torn apart at pericentre into a stream (the
+  // half that's bound trails inward, the other half is flung out), and the bound gas circularises into a ring that
+  // flares and then fades as t^-5/3, the classic tidal-disruption light curve.
+  float tt = uG[i].x;
+  if (tt >= 0.0) {
+    float rp = max(isco * 2.2, 3.5), ap = 2.2, t0 = 1.4;
+    if (tt < t0) {
+      float s = t0 - tt;
+      float rS = rp * (1.0 + 6.0*s*s), aS = ap - 2.6*s / (1.0 + s);
+      float dd = atan(sin(a0 - aS), cos(a0 - aS));
+      b += exp(-((rr - rS)*(rr - rS) + (rr*dd)*(rr*dd)) / 0.1) * 10.0;
+    } else {
+      float age = tt - t0;
+      float u = atan(sin(a0 - ap - age*1.2), cos(a0 - ap - age*1.2));   // along the stream, from pericentre
+      float spread = min(age * 2.0, 3.0);
+      float rS = u < 0.0 ? rp * (1.0 - 0.1*u) : rp * (1.0 + 0.8*u*u);
+      float w = 0.15 + 0.08*abs(u) + 0.08*age;
+      b += (u < 0.0 ? 4.0 : 2.5) * smoothstep(spread, spread*0.6, abs(u)) * exp(-age/2.0) * exp(-pow((rr - rS)/w, 2.0));
+      b += 3.0 * exp(-pow((rr - 2.0*rp)/(0.5 + 0.25*age), 2.0)) * smoothstep(0.8, 2.2, age) * pow(max(age, 1.0), -5.0/3.0);
+    }
+  }
+  if (b <= 0.0) return vec3(0, 0, 1);
+  // Relativistic beaming: gas orbiting toward us is much brighter than gas moving away.
+  vec3 v = normalize(vec3(-hp.z, 0.0, hp.x));
+  float beta = min(sqrt(0.5 * m / rAct), 0.95);
+  float dop = 1.0 / (inversesqrt(1.0-beta*beta) * (1.0 - beta*dot(v, -rd)));
+  b *= uI[i].w > 0.5 ? 1.0 : pow(dop, 3.0);
+  b *= sqrt(max(1.0 - m/rAct, 0.0));   // gravitational redshift dims the inner edge
+  // Thinning while it evaporates; it also cools, so the tone map reddens it.
+  return vec3(vec2(b, max(tau, b * 0.3)) * m * m, dop);
+}
+// Colour of Doppler-shifted light: gas coming toward you is blueshifted (hotter-looking), gas going away reddened.
+vec3 dopTint(float d, float amt){
+  if (amt <= 0.0) return vec3(1);
+  vec3 tint = clamp(kelvin(5200.0 * d) / max(kelvin(5200.0), vec3(0.05)), 0.0, 3.0);
+  return mix(vec3(1), tint, amt * 0.8);
+}
+// Colour grades for the light (the desktop behind is left alone): natural, filmic, warm, false colour, mono.
+vec3 gradeOf(vec3 c, float g){
+  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  if (g < 0.5) return c;
+  if (g < 1.5) { vec3 f = c * c * (3.0 - 2.0 * c); return mix(vec3(l), f, 0.85); }
+  if (g < 2.5) return mix(c, l * vec3(1.15, 0.82, 0.5) * 1.1, 0.7);
+  if (g < 3.5) {   // false colour, like a telescope image: dark purple through red and orange to white
+    vec3 a = mix(vec3(0.05, 0.0, 0.15), vec3(0.6, 0.05, 0.35), smoothstep(0.0, 0.3, l));
+    a = mix(a, vec3(1.0, 0.45, 0.05), smoothstep(0.25, 0.6, l));
+    return mix(a, vec3(1.0, 0.97, 0.85), smoothstep(0.6, 1.0, l));
+  }
+  return vec3(l);
+}
+
+// ---------- relativistic jets ----------
+// Plasma shot out along the spin axis at 0.92c. Seen from the side, both beams look alike; tipped toward you, the
+// approaching beam is Doppler boosted (brightness ~ D^(2+alpha)) and the receding one fades. Bright knots run outward.
+// Light gathered along a step of a ray (d0 to d1, relative to the hole) through the two beams around axis ax.
+vec3 jetLight(vec3 d0, vec3 d1, float segL, vec3 ax, vec3 rd, float Rs, float m){
+  vec3 u = (d1 - d0) / max(segL, 1e-4);
+  vec3 w0 = d0 - ax * dot(d0, ax), uu = u - ax * dot(u, ax);
+  float k2 = dot(uu, uu);
+  float t = k2 > 1e-6 ? clamp(-dot(w0, uu) / k2, 0.0, segL) : 0.5 * segL;   // closest approach to the axis
+  vec3 q = d0 + u * t;
+  float z = dot(q, ax), az = abs(z) / Rs;
+  if (az < 1.2 || az > 26.0) return vec3(0);
+  float rho = length(q - ax * z) / Rs, w = 0.22 + 0.07 * az;   // the beam widens slowly with distance
+  float g = exp(-rho * rho / (w * w));
+  if (g < 1e-3) return vec3(0);
+  float len = min(segL / Rs, 1.77 * w / max(sqrt(k2), 0.08));   // path length through the beam
+  float s = sign(z), beta = 0.92, gam = 2.55;
+  float boost = pow(1.0 / (1.0 - beta * dot(ax * s, -rd)), 2.6);   // relative to side-on (D * gamma)^(2+alpha)
+  float knots = 0.5 + 0.5 * sin(az * 1.2 - uTime * 3.0 + s * 1.7);
+  float fade = smoothstep(1.2, 2.5, az) * (1.0 - smoothstep(12.0, 26.0, az));
+  return vec3(0.72, 0.84, 1.0) * g * len / w * boost * (0.55 + 0.6 * knots) * fade * 0.55 * m * m;
+}
+
+// ---------- exact Kerr light paths ----------
+// Kerr-Schild Cartesian coordinates (M = 1, spin along +z), Hamiltonian form:
+//   H = 1/2 [ -1 + p.p - f S^2 ],  S = 1 + l.p,  f = 2 r^3 / (r^4 + a^2 z^2),
+//   l = ((r x + a y)/(r^2 + a^2), (r y - a x)/(r^2 + a^2), z/r),  r^4 - (R^2 - a^2) r^2 - a^2 z^2 = 0,
+//   dx/dl = p - f S l,   dp/dl = 1/2 S^2 grad f + f S (grad l)^T p.
+// Unlike Boyer-Lindquist coordinates, nothing goes singular on the spin axis. Checked: Schwarzschild shadow edge
+// at 5.1962 M (exact 3*sqrt(3)), spinning-hole shadow edges match Boyer-Lindquist, null condition holds to 1e-8.
+float ksDeriv(vec3 x, vec3 p, float a, out vec3 dx, out vec3 dp){
+  float R2 = dot(x, x), a2 = a*a;
+  float r2 = 0.5*(R2 - a2 + sqrt((R2 - a2)*(R2 - a2) + 4.0*a2*x.z*x.z)), r = sqrt(r2);
+  vec3 dr = vec3(r2*x.x, r2*x.y, r2*x.z + a2*x.z) / (r*(2.0*r2 - R2 + a2));
+  float D = r2*r2 + a2*x.z*x.z, f = 2.0*r2*r/D;
+  vec3 df = (6.0*r2*dr*D - 2.0*r2*r*(4.0*r2*r*dr + vec3(0.0, 0.0, 2.0*a2*x.z))) / (D*D);
+  float A = r2 + a2;
+  vec3 l = vec3((r*x.x + a*x.y)/A, (r*x.y - a*x.x)/A, x.z/r);
+  vec3 dlx = ((dr*x.x + vec3(r, a, 0.0))*A - (r*x.x + a*x.y)*2.0*r*dr) / (A*A);   // gradient of l.x
+  vec3 dly = ((dr*x.y + vec3(-a, r, 0.0))*A - (r*x.y - a*x.x)*2.0*r*dr) / (A*A);  // gradient of l.y
+  vec3 dlz = (vec3(0.0, 0.0, r) - x.z*dr) / r2;                                     // gradient of l.z
+  float S = 1.0 + dot(l, p);
+  dx = p - f*S*l;
+  dp = 0.5*S*S*df + f*S*(p.x*dlx + p.y*dly + p.z*dlz);
+  return r;
+}
+// Null momentum for a ray at x heading along unit vector n.
+vec3 ksStart(vec3 x, vec3 n, float a){
+  vec3 dx, dp; float R2 = dot(x, x), a2 = a*a;
+  float r2 = 0.5*(R2 - a2 + sqrt((R2 - a2)*(R2 - a2) + 4.0*a2*x.z*x.z)), r = sqrt(r2);
+  float f = 2.0*r2*r/(r2*r2 + a2*x.z*x.z);
+  vec3 l = vec3((r*x.x + a*x.y)/(r2 + a2), (r*x.y - a*x.x)/(r2 + a2), x.z/r);
+  float ln = dot(l, n), qa = 1.0 - f*ln*ln, qb = -2.0*f*ln, qc = -(1.0 + f);
+  return n * (-qb + sqrt(qb*qb - 4.0*qa*qc)) / (2.0*qa);
+}
+
+void main(){
+  vec2 p = gl_FragCoord.xy + uJitter;
+  // Retro mode (the Konami code): inside that hole's lens everything snaps to chunky pixels and a small palette.
+  float retro = 0.0, block = 1.0;
+  for (int i = 0; i < MAXH; i++) {
+    if (i >= uN) break;
+    if (uG[i].w > 0.0 && length(gl_FragCoord.xy - uA[i].xy) < LENS * uA[i].z) {
+      retro = max(retro, uG[i].w);
+      block = max(4.0, floor(uC[i].w * 0.33));
+    }
+  }
+  if (retro > 0.5) p = (floor(gl_FragCoord.xy / block) + 0.5) * block;
+  // Glitch: the picture of the hole is broken into square blocks, like a corrupted video frame or screen tearing. A few
+  // always sit slightly out of place; every so often there's a burst: blocks jump or swap, and strips tear sideways.
+  float glitch = 0.0, gs = floor(uTime * 9.0), seam = 0.0;
+  for (int i = 0; i < MAXH; i++) {
+    if (i >= uN) break;
+    if (!has(i, FX_GLITCH) || length(gl_FragCoord.xy - uA[i].xy) > uA[i].z * 9.0) continue;   // the hole and its disk
+    float burst = max(step(0.8, hash(vec3(gs, float(i), 3.1))), uH[i].y);
+    float size = max(16.0, uA[i].z * 2.4);
+    vec2 fc = gl_FragCoord.xy - uA[i].xy;
+    vec2 bc = floor(fc / size), within = fract(fc / size);
+    float slow = floor(uTime * 0.5), pick = hash(vec3(bc, slow + float(i) * 13.0));
+    vec2 off = vec2(0);
+    if (pick > 0.82) off = (vec2(hash(vec3(bc, slow + 1.7)), hash(vec3(bc.yx, slow + 2.3))) - 0.5) * size * 0.5;   // slightly out of place
+    if (burst > 0.0) {
+      float bp = hash(vec3(bc, gs + 5.0));
+      if (bp > 0.55) off = (vec2(hash(vec3(bc, gs + 6.0)), hash(vec3(bc.yx, gs + 7.0))) - 0.5) * size * 1.6;   // jumped
+      else if (bp > 0.35) off = floor(vec2(hash(vec3(bc, gs + 8.0)), hash(vec3(bc.yx, gs + 9.0))) * 5.0 - 2.0) * size;   // swapped with another piece
+      float strip = floor(fc.y / (size * 0.25));   // tearing: thin horizontal strips shoved sideways
+      if (hash(vec3(strip, gs, 11.0)) > 0.8) { off.x += (hash(vec3(strip, gs, 12.0)) - 0.5) * size * 3.0; within.y = 0.5; }
+    }
+    if (dot(off, off) > 0.0) {
+      p += off;
+      float e = min(min(within.x, 1.0 - within.x), min(within.y, 1.0 - within.y)) * size;
+      seam = max(seam, 1.0 - smoothstep(0.5, 2.5, e));
+      glitch = 1.0;
+    }
+  }
+
+  // Which holes reach this pixel; the nearest one sets the background depth scale.
+  float mask = 0.0, taper = 0.0, nearQ = 1e9;
+  int near = 0;
+  for (int i = 0; i < MAXH; i++) {
+    if (i >= uN) break;
+    float q = length(p - uA[i].xy) / (LENS * uA[i].z);
+    mask = max(mask, (1.0 - smoothstep(0.85, 1.0, q)) * uC[i].x);
+    // Real deflection falls off only as 1/distance; taper it to zero before the edge fade so the lensed area
+    // meets the desktop seamlessly (otherwise the real desktop and a shifted copy show at once).
+    taper = max(taper, 1.0 - smoothstep(0.4, 0.8, q));
+    if (q < nearQ) { nearQ = q; near = i; }
+  }
+  if (mask <= 0.0) { outColor = vec4(0); outBright = vec4(0); return; }   // (the share view adds the desktop later)
+
+  // Per-hole frames: the scene is seen face-on from far away (parallel rays); each disk is tipped toward you by its
+  // inclination and rolled about the view axis. The spin axis is perpendicular to the disk.
+  vec3 ctr[MAXH], nrm[MAXH], ex[MAXH], ez[MAXH], hcol[MAXH];
+  float rs[MAXH], rh[MAXH], hk[MAXH], crosses[MAXH];
+  float zs = 0.0;
+  for (int i = 0; i < MAXH; i++) {
+    if (i >= uN) break;
+    ctr[i] = vec3(uA[i].xy, 0.0);
+    float inc = uB[i].x, rol = uB[i].y;
+    mat2 R = mat2(cos(rol), sin(rol), -sin(rol), cos(rol));
+    nrm[i] = vec3(R * vec2(0.0, cos(inc)), -sin(inc));
+    ex[i]  = vec3(R * vec2(1.0, 0.0), 0.0);
+    ez[i]  = vec3(R * vec2(0.0, sin(inc)), cos(inc));
+    rs[i] = uA[i].z * uA[i].w;   // current Schwarzschild radius (shrinks while evaporating)
+    rh[i] = rs[i] * uE[i].z;     // Kerr horizon: smaller than Rs for a spinning hole
+    // Hawking radiation: temperature ~ 1/M, so surface brightness (~ T^4) ~ M^-4 while the area ~ M^2:
+    // a shrinking, ever hotter, ever brighter ball, traced through the same bent rays as everything else.
+    float m = max(uA[i].w, 1e-3);
+    hcol[i] = uB[i].z > 0.0 ? kelvin(1500.0 / m) * 0.004 * uB[i].z / (m*m*m*m) : vec3(0);
+    hk[i] = 3.0 / m;
+    crosses[i] = 0.0;
+    zs = max(zs, 30.0 * uA[i].z);
+  }
+
+  // Far out (beyond half the lens radius), with no disk, jets, star or evaporation in the way, the bending is the weak
+  // field's, known in closed form to second order: 2Rs/b + (15 pi/16)(Rs/b)^2 per hole. No need to trace those rays.
+  bool shortcut = nearQ > 0.56;
+  for (int i = 0; i < MAXH; i++) {
+    if (i >= uN || !shortcut) break;
+    if (uB[i].z > 0.0 || uB[i].w >= 0.0 || uG[i].x >= 0.0 || uC[i].y >= 0.0 || has(i, FX_JETS) || has(i, FX_COMP) || has(i, FX_DEBRIS)) { shortcut = false; break; }
+    float inc = uB[i].x, rol = uB[i].y;
+    vec3 nz = vec3(mat2(cos(rol), sin(rol), -sin(rol), cos(rol)) * vec2(0.0, cos(inc)), -sin(inc));
+    if (abs(nz.z) > 1e-3) {   // where the straight line of sight crosses this disk's plane
+      vec3 hit = vec3(p - uA[i].xy, 0.0) + vec3(0, 0, 1) * (-dot(vec3(p - uA[i].xy, 0.0), nz) / nz.z);
+      if (length(hit - nz * dot(hit, nz)) / uA[i].z < uF[i].x * 1.75 / max(uA[i].w, 0.05)) shortcut = false;
+    }
+  }
+  vec3 pos = vec3(p, -zs), vel = vec3(0, 0, 1), velF = vel;
+  if (nearQ > 0.5) {
+    vec2 bend = vec2(0);
+    for (int i = 0; i < MAXH; i++) {
+      if (i >= uN) break;
+      vec2 d = uA[i].xy - p; float b = length(d), rr = uA[i].z * uA[i].w / b;
+      bend += d / b * (2.0 * rr + 2.945 * rr * rr);
+    }
+    float a = length(bend);
+    velF = a > 1e-6 ? vec3(bend / a * sin(a), cos(a)) : vec3(0, 0, 1);
+    if (shortcut) vel = velF;
+  }
+  vec3 Ld = vec3(0), em = vec3(0);   // disk light / other emitted light (both linear, tone-mapped at the end)
+  float trans = 1.0;
+  int captured = -1, zone = -1;      // zone: which hole's exact Kerr region the ray is in (-1 = none)
+  bool escaped = false;
+  vec3 kx = vec3(0), kp = vec3(0); float aM = 0.0, Mpx = 1.0;   // Kerr-zone state: position and momentum (hole frame, M)
+  float phg = 0.0;                   // photon sphere glow: how long the ray lingered where light can orbit
+
+  if (shortcut) escaped = true;
+  for (int s = 0; s < 420; s++) {
+    if (shortcut) break;
+    vec3 prev = pos;
+    if (zone < 0) {
+      // Far from every hole: weak field. Newtonian-style force with the exact Schwarzschild orbit shape, holes added.
+      vec3 acc = vec3(0);
+      float rn = 1e9, rsn = 1.0, outward = 0.0, enterQ = 1e9;
+      int enter = -1;
+      for (int i = 0; i < MAXH; i++) {
+        if (i >= uN) break;
+        if (rs[i] <= 0.0) continue;
+        vec3 d = pos - ctr[i];
+        float r = length(d);
+        // Inside a hole's strong field: the exact equations take over. Where two holes' fields overlap, the one the ray
+        // is relatively closest to (in its own Schwarzschild radii) is the one that steers.
+        if (r < ZONE * 0.5 * rs[i] && r / rs[i] < enterQ) { enter = i; enterQ = r / rs[i]; }
+        float x = r / uA[i].z;
+        if (x < rn) { rn = x; rsn = uA[i].z; outward = dot(d, vel); }
+        vec3 L = cross(d, vel);
+        acc += -1.5 * rs[i] * dot(L, L) * d / pow(r, 5.0);
+      }
+      if (enter >= 0) {
+        int i = enter; vec3 d = pos - ctr[i];
+        zone = i; aM = uE[i].x; Mpx = 0.5 * rs[i];
+        kx = vec3(dot(d, ex[i]), dot(d, ez[i]), -dot(d, nrm[i])) / Mpx;
+        kp = ksStart(kx, vec3(dot(vel, ex[i]), dot(vel, ez[i]), -dot(vel, nrm[i])), aM);
+        continue;
+      }
+      // Far from every hole and heading away: escaped. (Not "past the holes": light bent more than 90 degrees heads
+      // back toward you and would never get past them.)
+      if (rn > 30.0 && outward > 0.0) { escaped = true; break; }
+      float dt = clamp((rn > 12.0 ? 0.1 : 0.06) * rn, 0.02, 1.5) * rsn * uStep;   // longer steps where nothing much bends
+      vel = normalize(vel + acc * dt);
+      pos += vel * dt;
+    } else {
+      // Inside hole 'zone''s strong field: exact Kerr, 4th-order Runge-Kutta in the affine parameter.
+      float rhM = 1.0 + sqrt(max(1.0 - aM*aM, 0.0));
+      vec3 a1, b1, a2, b2, a3, b3, a4, b4;
+      float r = ksDeriv(kx, kp, aM, a1, b1);
+      if (r < rhM * 1.01 || r != r) { captured = zone; break; }
+      // Back out of the strong field and heading away: hand over to the weak-field formula (vel is the last step's).
+      if (r > ZONE * 1.05 && dot(a1, kx) > 0.0) { zone = -1; continue; }
+      // Step: a few percent of r, smaller near the horizon (4th-order Runge-Kutta in the affine parameter).
+      float h = clamp(0.04 * r * clamp(r - rhM, 0.06, 1.0) * (r > 10.0 ? 1.5 : 1.0) * uStep, 0.003, 2.0);
+      ksDeriv(kx + 0.5*h*a1, kp + 0.5*h*b1, aM, a2, b2);
+      ksDeriv(kx + 0.5*h*a2, kp + 0.5*h*b2, aM, a3, b3);
+      ksDeriv(kx + h*a3, kp + h*b3, aM, a4, b4);
+      kx += h/6.0 * (a1 + 2.0*a2 + 2.0*a3 + a4);
+      if (has(zone, FX_PHOTON)) phg += h * exp(-pow((r - 2.9) / 1.0, 2.0));
+      kp += h/6.0 * (b1 + 2.0*b2 + 2.0*b3 + b4);
+      vec3 X = kx * Mpx;
+      pos = ctr[zone] + ex[zone]*X.x + ez[zone]*X.y - nrm[zone]*X.z;
+      vel = normalize(pos - prev);
+      // Other holes keep pulling while this one's exact equations steer the ray (close pairs bend light together).
+      // And if the ray gets relatively closer to another hole than to this one, that hole takes over (so a hole sitting
+      // inside another's field still has its own shadow); right at another hole, it's captured.
+      int handTo = -1;
+      float dA = length(pos - ctr[zone]) / rs[zone];
+      for (int j = 0; j < MAXH; j++) {
+        if (j >= uN) break;
+        if (j == zone || rs[j] <= 0.0) continue;
+        vec3 dj = pos - ctr[j], Lj = cross(dj, vel);
+        float dB = length(dj) / rs[j];
+        if (dB < 1.0) { captured = j; handTo = -2; break; }
+        if (dB < dA * 0.8 && dB < ZONE * 0.5) { handTo = j; break; }
+        vec3 dv = -1.5 * rs[j] * dot(Lj, Lj) * dj / pow(length(dj), 5.0) * (h * Mpx);
+        kp += vec3(dot(dv, ex[zone]), dot(dv, ez[zone]), -dot(dv, nrm[zone])) * length(kp);
+      }
+      if (handTo == -2) break;
+      if (handTo >= 0) zone = -1;   // the weak-field step re-enters, into the closer hole
+    }
+
+    // What this step of the ray passes through: the disks (with real thickness) and the Hawking glow.
+    vec3 seg = pos - prev;
+    float segL = length(seg);
+    for (int i = 0; i < MAXH; i++) {
+      if (i >= uN) break;
+      float Rs = uA[i].z;
+      vec3 d0 = prev - ctr[i], d1 = pos - ctr[i];
+      if (uB[i].z > 0.0) em += trans * hcol[i] * hk[i] * pow(rs[i] / max(length(d1), 1e-3), 4.0) / Rs * segL;
+      int bits = int(uH[i].x) & FXMASK;
+      if ((bits & FX_JETS) != 0) em += trans * jetLight(d0, d1, segL, nrm[i], vel, Rs, uA[i].w);
+      if ((bits & FX_COMP) != 0) {   // the companion: a small sun-like star orbiting just outside the disk, being stripped
+        float phs = uTime * 6.2832 / 40.0 + float(i) * 2.1, rc = uF[i].x * 1.45 / max(uA[i].w, 0.05) * Rs;
+        vec3 S = (ex[i] * cos(phs) + ez[i] * sin(phs)) * rc, u = seg / max(segL, 1e-4);
+        float dist = length(d0 + u * clamp(dot(S - d0, u), 0.0, segL) - S) / Rs, sr = 0.45;
+        if (dist < sr) { em += trans * kelvin(5400.0) * (1.8 - 0.9 * dist / sr); trans = 0.0; }   // opaque, limb-darkened
+        else em += trans * kelvin(5400.0) * exp(-dist * dist / (sr * sr * 3.0)) * min(segL / Rs, 3.0 * sr) * 0.25;   // its glow
+      }
+      float y0 = dot(d0, nrm[i]), y1 = dot(d1, nrm[i]);
+      if (y0 * y1 < 0.0) crosses[i] += 1.0;
+      vec3 mid = 0.5*(d0 + d1);
+      float rpl = length(mid - nrm[i]*dot(mid, nrm[i])) / Rs;   // distance from the axis, in Rs
+      if (rpl * max(uA[i].w, 0.05) > uF[i].x * 1.6 || rpl < uE[i].y * uA[i].w * 0.5) continue;
+      vec3 vl = vec3(dot(vel, ex[i]), dot(vel, nrm[i]), dot(vel, ez[i]));
+      // Scale height (px): a real disk is about this thick at this radius. Never thinner than a pixel, so light
+      // grazing an almost edge-on disk is sampled smoothly instead of hitting or missing it pixel by pixel.
+      float H = max(uE[i].w * rpl * Rs, 0.75);
+      // Thick disk: a vertical Gaussian of gas. Sample where this step passes through it, weighting by density so the
+      // whole column adds up to what a thin disk gives, with lumpy, puffy gas above and below the mid-plane.
+      // Warped: the disk's plane tips more the further out you go (and slowly precesses).
+      float warpA = (bits & FX_WARPED) != 0 ? 0.4 * Rs * max(rpl - 3.0, 0.0) : 0.0;
+      float lim = max(2.5 * H, uI[i].y > 0.0 ? 5.0 * H : 0.0) + warpA;
+      if (y0 * y1 > 0.0 && min(abs(y0), abs(y1)) > lim) continue;
+      float ta = 0.0, tb = 1.0;
+      if (abs(y1 - y0) > 1e-4) {
+        float t1 = (lim - y0)/(y1 - y0), t2 = (-lim - y0)/(y1 - y0);
+        ta = clamp(min(t1, t2), 0.0, 1.0); tb = clamp(max(t1, t2), 0.0, 1.0);
+      }
+      float len = segL * (tb - ta);
+      if (len <= 0.0) continue;
+      for (int k = 0; k < 2; k++) {
+        vec3 q = mix(d0, d1, mix(ta, tb, (float(k) + 0.5) * 0.5));
+        float yy = dot(q, nrm[i]);
+        vec3 hl = vec3(dot(q, ex[i]), yy, dot(q, ez[i])) / Rs;
+        if (warpA > 0.0) { yy -= 0.4 * Rs * max(length(hl.xz) - 3.0, 0.0) * sin(atan(hl.z, hl.x) + 0.6 + uTime * 0.05); hl.y = yy / Rs; }
+        float dens = exp(-0.5*yy*yy/(H*H)) / (2.5066*H);
+        dens *= 0.55 + 0.9 * noise(vec3(hl.x*1.3, yy/H*0.9 + uTime*0.05, hl.z*1.3));
+        float w = dens * len * 0.5;
+        vec3 bt = diskB(i, hl, vl, crosses[i]);
+        // Self-shadowing: the puffed-up inner rim shades the outer disk's mid-plane; only gas higher up is lit.
+        float lit = smoothstep(0.15, 1.4, abs(yy) / H);
+        float shade = mix(1.0, 0.35 + 0.65 * lit, smoothstep(0.02, 0.12, uE[i].w) * smoothstep(1.4, 3.0, length(hl.xz) * uA[i].w / max(uE[i].y, 1e-3)));
+        Ld += trans * bt.x * w * uD[i].rgb * uF[i].y * shade * dopTint(bt.z, uH[i].w);
+        if (uJ[i].y > 0.0 && abs(yy) > 0.4 * H && abs(yy) < 3.4 * H) {   // the corona: hot, flickering plasma just above the inner disk
+          float rq = length(hl.xz) * uA[i].w, isc = uE[i].y;
+          float flick = 0.45 + 0.55 * noise(vec3(rq * 2.5, atan(hl.z, hl.x) * 2.0, uTime * 5.0));
+          float cd = smoothstep(isc * 0.9, isc * 1.3, rq) * (1.0 - smoothstep(isc * 2.5, isc * 4.5, rq)) * exp(-pow(abs(yy) / H - 1.4, 2.0) / 0.8);
+          Ld += trans * vec3(0.75, 0.85, 1.0) * uJ[i].y * cd * flick * flick * segL / Rs * 1.6;
+        }
+        if (uI[i].y > 0.0 && abs(yy) > H) {   // a disk wind: gas blown up off the surface, streaming outward
+          float rq = length(hl.xz) * uA[i].w, up = abs(yy) / H;
+          float streak = noise(vec3(rq * 1.6 - uTime * 0.7, atan(hl.z, hl.x) * 3.0, up * 0.8 - uTime * 0.5));
+          float wd = exp(-pow(up - 2.6, 2.0) / 1.2) * smoothstep(uE[i].y * 2.0, uE[i].y * 4.0, rq) * (1.0 - smoothstep(uF[i].x * 0.6, uF[i].x * 1.1, rq));
+          Ld += trans * uD[i].rgb * 0.55 * uI[i].y * wd * pow(streak, 3.0) * segL / Rs * 0.7;
+        }
+        trans *= exp(-bt.y * w * uF[i].y);
+      }
+    }
+    if (trans < 0.01) { escaped = true; break; }   // hidden behind opaque disk; what's beyond no longer matters
+  }
+  if (captured >= 0) em += hcol[captured];   // looking straight at a glowing horizon
+  // Still circling when the step budget ran out: it's skimming the photon sphere, the very edge of the shadow.
+  bool dark = captured >= 0 || !escaped;
+  if (!shortcut && nearQ > 0.5 && !dark) vel = normalize(mix(vel, velF, smoothstep(0.5, 0.56, nearQ)));   // seamless hand-over
+  if (phg > 0.0) em += vec3(1.0, 0.9, 0.75) * phg * 0.12;
+  int nb = int(uH[near].x) & FXMASK;
+  bool repel = (nb & (FX_WHITE | FX_INVERT)) != 0;
+
+  // Background: thin-lens mapping onto the desktop, treated as a plane behind the holes.
+  vec2 defl = deflection(vel) * BG * uC[near].w;
+  if (repel) {   // white hole / inverted: the bending pushes light outward instead, and nothing is captured: no shadow
+    vec2 dc = p - uA[near].xy;
+    float bb = length(dc) / uA[near].z;
+    defl = (bb > 1e-3 ? dc / length(dc) : vec2(0)) * uA[near].z * 6.0 * bb / (bb * bb / 9.0 + 1.0);   // at most 9 Rs
+    dark = false;
+  }
+  vec2 src = p + defl * taper;
+  // A merger sends out gravitational waves: a ripple that runs outward across the desktop and dies away.
+  for (int i = 0; i < MAXH; i++) {
+    if (i >= uN) break;
+    if (has(i, FX_RIPPLES)) {   // still ringing: a faint ripple runs out every few seconds
+      vec2 d = src - uA[i].xy;
+      float tr = mod(uTime + float(i) * 1.3, 4.0), front = length(d) / uA[i].z - 3.0 - 9.0 * tr;
+      src += normalize(d + 1e-4) * uA[i].z * 0.45 * sin(front * 1.6) * exp(-front * front / 30.0) * exp(-0.5 * tr) * taper;
+    }
+    if (uC[i].z < 0.0) continue;
+    vec2 d = src - uA[i].xy;
+    float t = uC[i].z, front = length(d) / uA[i].z - 35.0 * t;
+    src += normalize(d + 1e-4) * uA[i].z * 0.5 * sin(front * 1.3) * exp(-front*front / 40.0) * exp(-1.5 * t) * taper;
+  }
+  vec2 sp = vec2(src.x, uRes.y - src.y) / uPxScale + uWinOrigin;
+  vec2 tc = (sp - uCapOrigin) / uCapSize;
+  // Explicit gradients: where the bending changes fast (the photon ring) the mipmaps average the background
+  // smoothly instead of picking scattered pixels.
+  vec2 gx = dFdx(tc), gy = dFdy(tc);
+  vec3 bg = vec3(0);
+  if (!dark) bg = uHasScreen ? textureGrad(uScreen, tc, gx, gy).bgr : uFlatBg;
+  // A window being swallowed is just more of what's behind: bent like the desktop, and hidden by the shadow.
+  if (!dark && uHasMeal) { vec4 mm = texture(uMeal, src / uRes); bg = mm.rgb + bg * (1.0 - mm.a); }
+  // Light bent back past 90 degrees comes from behind you, where there's no desktop, just empty space.
+  float ahead = repel ? 1.0 : 1.0 - smoothstep(1.4, 2.2, acos(clamp(vel.z, -1.0, 1.0)));
+  bg *= ahead;
+  for (int i = 0; i < MAXH; i++) {
+    if (i >= uN) break;
+    if (uJ[i].z < 0.5 || uF[i].z < 0.5) continue;
+    vec2 q = p - (uA[i].xy + vec2(0.0, -1.6 * rs[i]));
+    vec2 ax = normalize(ex[i].xy + 1e-4), ay = vec2(-ax.y, ax.x);
+    float A = uF[i].x * 0.75 / max(uA[i].w, 0.05) * uA[i].z, B = max(A * abs(sin(uB[i].x)) * 1.5, 2.2 * rs[i]);
+    float u = dot(q, ax) / A, w = dot(q, ay) / B;
+    bg *= 1.0 - 0.33 * uC[i].x * exp(-1.8 * (u * u + w * w));
+  }
+  // Wormhole: through the shadow, another monitor, as if through a fisheye at the far end of the throat.
+  if (dark && (nb & FX_WORM) != 0 && uHasWorm) {
+    vec2 q = (p - uA[near].xy) / (2.6 * max(rs[near], 1e-3));
+    float l2 = dot(q, q);
+    bg = texture(uWorm, 0.5 + vec2(q.x, -q.y) * 0.5 * (0.7 + 0.3 * l2)).bgr * (1.0 - smoothstep(0.5, 1.0, l2));
+  }
+  for (int i = 0; i < MAXH; i++) {
+    if (i >= uN) break;
+    vec2 dc = p - uA[i].xy;
+    float bb = length(dc) / max(rs[i], 1e-3), ang = atan(dc.y, dc.x);
+    if (has(i, FX_WHITE)) {      // a white hole: where the shadow would be, a blinding core, and light streaming outward
+      em += vec3(1.0, 0.97, 0.9) * 3.0 * (1.0 - smoothstep(1.6, 2.8, bb));
+      em += vec3(0.9, 0.95, 1.0) * 0.5 * pow(noise(vec3(cos(ang) * 4.0, sin(ang) * 4.0, bb * 0.8 - uTime * 1.5)), 4.0) * exp(-bb / 5.0) * 3.0;
+    }
+    if (uJ[i].x > 0.0) {   // lined up with another hole: the photon sphere glows, and slow rings of light ease outward from it
+      float f = fract(uTime / 5.0 + float(i) * 0.37), rr = 2.6 + 4.0 * f;
+      em += kelvin(9000.0) * uJ[i].x * (0.45 * exp(-pow((bb - 2.6) / 0.14, 2.0)) + 0.55 * (1.0 - f) * exp(-pow((bb - rr) / (0.22 + 0.3 * f), 2.0)));
+    }
+    if (has(i, FX_HAWKING)) {    // a faint, slowly shifting halo, as if it's quietly evaporating
+      float wob = noise(vec3(cos(ang) * 1.5, sin(ang) * 1.5, uTime * 0.15));
+      float halo = exp(-pow((bb - (2.9 + 0.6 * wob)) / (0.8 + 0.5 * wob), 2.0));
+      em += vec3(0.7, 0.8, 1.0) * halo * 0.45 * (0.7 + 0.5 * sin(uTime * 0.4 + ang * 2.0 + wob * 3.0));
+    }
+    if (has(i, FX_STARS) && !dark) {   // distant stars behind it, bent into arcs and doubled by the lens
+      vec2 o = (src - uA[i].xy) / uA[i].z, cell = floor(o / 3.0);
+      for (int cx = -1; cx <= 1; cx++) for (int cy = -1; cy <= 1; cy++) {
+        vec2 c = cell + vec2(cx, cy);
+        if (hash(vec3(c, 7.0 + float(i))) > 0.4) continue;
+        vec2 sp = (c + vec2(hash(vec3(c, 1.3)), hash(vec3(c, 2.7)))) * 3.0;
+        float dd = length(o - sp);
+        em += kelvin(3500.0 + 9000.0 * hash(vec3(c, 5.2))) * (0.4 + 1.6 * pow(hash(vec3(c, 4.1)), 3.0)) * exp(-dd * dd / 0.01) * ahead;
+      }
+    }
+  }
+
+  // The Einstein ring: a faint, distant star sits exactly behind each hole. Seen through the lens, a source on the
+  // line of sight becomes a ring at the Einstein radius (and is hidden by the shadow where you'd naively expect it).
+  if (!dark && uG[near].y > 0.0) {
+    vec2 o = (p + defl - uA[near].xy) / uC[near].w;
+    em += kelvin(8500.0) * uG[near].y * 0.9 * exp(-dot(o, o) / 0.02) * ahead;
+  }
+
+  // The final burst of an evaporating hole: a spherical shell of radiation expanding at light speed. We see
+  // through more of a thin shell near its rim, so it's limb-brightened; it cools as it spreads.
+  for (int i = 0; i < MAXH; i++) {
+    if (i >= uN) break;
+    float t = uB[i].w;
+    if (t < 0.0) continue;
+    float R = 0.5 + 22.0 * t, w = 0.6 + 1.5 * t;
+    float ri = max(R - 0.5*w, 0.0), ro = R + 0.5*w;
+    float b = length(p - uA[i].xy) / uA[i].z, b2 = b*b;
+    float path = 2.0 * (sqrt(max(ro*ro - b2, 0.0)) - sqrt(max(ri*ri - b2, 0.0)));
+    em += kelvin(30000.0 / (1.0 + R / 3.0)) * path * 40.0 / (12.566 * R*R * w);
+  }
+
+  vec3 light = Ld + em;
+  vec3 col = trans * bg + gradeOf(1.0 - exp(-light), uH[near].z);   // exposure: overexposed light clips toward white like a camera's would
+  if (retro > 0.0) {   // 4x4 ordered dithering down to 5 levels per channel, like an old console
+    vec2 bc = floor(gl_FragCoord.xy / block);
+    int bi = int(mod(bc.x, 4.0)) + 4 * int(mod(bc.y, 4.0));
+    float th[16] = float[16](0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+    vec3 q = floor(col * 4.0 + th[bi] / 16.0) / 4.0;
+    col = mix(col, q, retro);
+  }
+  col *= 1.0 - 0.75 * seam;   // the dark seams between glitched pieces
+  outColor = vec4(col * mask, mask);   // premultiplied; edges (and fading holes) give way to the real desktop
+  outBright = vec4(max(light - 0.35, 0.0) * mask, 1.0);
+}`;
+
+// Swallowed windows: the window's image as a fine mesh that falls in.
+const MEAL_VS = `#version 300 es
+in vec2 aUV;
+out vec2 vUV; out float vA; out float vFall;
+uniform vec4 uRect;     // window x, y, w, h (render px, y down)
+uniform vec2 uHole;     // hole centre (render px, y down)
+uniform float uT, uRs, uSpin, uWhite, uTide;
+uniform vec2 uRes;
+void main(){
+  vec2 P = uRect.xy + aUV * uRect.zw;
+  vec2 d = P - uHole;
+  float rho = length(d), psi = atan(d.y, d.x);
+  vec2 dc = uRect.xy + uRect.zw*0.5 - uHole;
+  float rmax = length(dc) + 0.5*length(uRect.zw);
+  // Tides: the near side is pulled harder than the far side, so it starts falling first. That difference is what
+  // stretches the window into a long strand (spaghettification) while squeezing it sideways.
+  // Tides at the horizon go as 1/M^2: a small hole spaghettifies a window, a big one swallows it nearly whole.
+  float delay = 0.9 * uTide * clamp(rho / max(rmax, 1.0), 0.0, 1.0);
+  float tau = clamp((uT - delay) / 1.5, 0.0, 1.0);
+  float fall = tau*tau*(3.0 - 2.0*tau);
+  float r = uWhite > 0.5 ? rho * (1.0 + 3.0 * fall * fall) : mix(rho, uRs * 1.2, fall);   // a white hole flings it out
+  float psiC = atan(dc.y, dc.x);
+  float dpsi = atan(sin(psi - psiC), cos(psi - psiC));
+  // It winds around the hole as it falls, faster the closer it gets (and the way the disk turns).
+  float ang = psiC + dpsi * (1.0 - 0.94*fall*min(uTide, 1.0)*(1.0 - uWhite)) + (1.0 - uWhite) * uSpin * fall*fall * 3.5 / (0.35 + r / (uRs * 12.0));
+  vec2 Q = uHole + r * vec2(cos(ang), sin(ang));
+  vA = 1.0 - smoothstep(0.7, 1.0, fall);
+  vFall = fall;
+  vUV = aUV;
+  gl_Position = vec4(Q.x / uRes.x * 2.0 - 1.0, 1.0 - Q.y / uRes.y * 2.0, 0.0, 1.0);
+}`;
+const MEAL_FS = `#version 300 es
+precision highp float;
+in vec2 vUV; in float vA; in float vFall;
+layout(location = 0) out vec4 o;
+uniform sampler2D uTex;
+uniform bool uAlpha;   // file icons have transparency (premultiplied); captured windows don't
+void main(){
+  vec4 t = texture(uTex, vUV);
+  float a = uAlpha ? t.a : 1.0;
+  vec3 c = uAlpha ? t.bgr : t.bgr * a;
+  c = mix(c, c * vec3(1.0, 0.45, 0.25), vFall);   // redshifted and dimmed as it nears the horizon
+  o = vec4(c * vA, a * vA);
+}`;
+
+const COPY_FS = `#version 300 es
+precision highp float;
+out vec4 o;
+uniform sampler2D uSrc; uniform vec2 uTexel;
+void main(){   // 2x2 box downsample
+  vec2 uv = gl_FragCoord.xy * uTexel;
+  o = 0.25 * (texture(uSrc, uv + uTexel*vec2(-0.5,-0.5)) + texture(uSrc, uv + uTexel*vec2(0.5,-0.5)) +
+              texture(uSrc, uv + uTexel*vec2(-0.5,0.5)) + texture(uSrc, uv + uTexel*vec2(0.5,0.5)));
+}`;
+const BLUR_FS = `#version 300 es
+precision highp float;
+out vec4 o;
+uniform sampler2D uSrc; uniform vec2 uDir; uniform vec2 uSize;
+void main(){   // 13-tap Gaussian along uDir
+  vec2 uv = gl_FragCoord.xy / uSize;
+  const float W[7] = float[7](0.1964825501511404, 0.2969069646728344, 0.09447039785044732, 0.010381362401148057, 0.0, 0.0, 0.0);
+  vec4 s = texture(uSrc, uv) * W[0];
+  for (int i = 1; i < 4; i++) {
+    vec2 off = uDir * (float(i) * 2.0 - 0.5) / uSize;
+    s += (texture(uSrc, uv + off) + texture(uSrc, uv - off)) * W[i];
+  }
+  o = s;
+}`;
+
+// Temporal anti-aliasing: each frame is traced at a slightly different sub-pixel offset and blended into a running
+// history, so detail finer than a pixel (the photon ring, the thinnest disk images) averages into a clean line.
+// The history is clamped to the colours around each pixel this frame, so anything that moves never leaves a ghost.
+const TAA_FS = `#version 300 es
+precision highp float;
+out vec4 o;
+uniform sampler2D uCur, uHist; uniform vec2 uRes; uniform float uBlend; uniform bool uReset;
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  vec4 c = texture(uCur, uv);
+  if (uReset) { o = c; return; }
+  vec4 mn = c, mx = c;
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+    vec4 s = texture(uCur, uv + vec2(x, y) / uRes);
+    mn = min(mn, s); mx = max(mx, s);
+  }
+  o = mix(clamp(texture(uHist, uv), mn, mx), c, uBlend);
+}`;
+
+const COMP_FS = `#version 300 es
+precision highp float;
+out vec4 o;
+#define MAXH ${MAXH}
+uniform sampler2D uScene, uBloomA, uBloomB, uScreen, uMeal;
+uniform bool uHasMeal;
+uniform vec2 uRes;
+uniform float uBloomAmt;
+uniform int uN;
+uniform vec4 uMB[MAXH];   // hole centre (render px, y up), velocity per frame (render px)
+uniform vec4 uMR[MAXH];   // lens radius (render px)
+uniform bool uShare;
+uniform vec2 uWinOrigin, uCapOrigin, uCapSize; uniform float uPxScale;
+void main(){
+  vec2 p = gl_FragCoord.xy, uv = p / uRes;
+  vec4 c = texture(uScene, uv);
+  // Motion blur: inside a moving hole's lens, average along its motion over roughly one frame's exposure.
+  for (int i = 0; i < MAXH; i++) {
+    if (i >= uN) break;
+    vec2 v = uMB[i].zw;
+    if (dot(v, v) < 2.0) continue;
+    float wgt = 1.0 - smoothstep(0.75, 1.05, length(p - uMB[i].xy) / uMR[i].x);
+    if (wgt <= 0.0) continue;
+    vec4 a = vec4(0);
+    for (int k = -4; k <= 4; k++) a += texture(uScene, (p + v * float(k) / 8.0) / uRes);
+    c = mix(c, a / 9.0, wgt);
+  }
+  // Outside the lens, a swallowed window's falling image is drawn as-is under everything.
+  if (uHasMeal) c += texture(uMeal, uv) * (1.0 - c.a);
+  vec3 bl = (texture(uBloomA, uv).rgb * 0.6 + texture(uBloomB, uv).rgb * 0.4) * uBloomAmt;
+  vec3 rgb = min(c.rgb + bl, 1.0);
+  float a = max(c.a, max(rgb.r, max(rgb.g, rgb.b)));
+  if (uShare) {   // share view: the desktop under everything, opaque
+    vec2 sp = vec2(p.x, uRes.y - p.y) / uPxScale + uWinOrigin;
+    vec3 desk = texture(uScreen, (sp - uCapOrigin) / uCapSize).bgr;
+    o = vec4(rgb + desk * (1.0 - a), 1.0);
+  } else o = vec4(rgb, a);
+}`;
+
+function compile(vsSrc, fsSrc) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  };
+  const prog = gl.createProgram();
+  gl.attachShader(prog, mk(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(prog, mk(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  const locs = {};
+  prog.u = n => locs[n] ??= gl.getUniformLocation(prog, n);
+  return prog;
+}
+// The scene shader is compiled per set of effects in use (most people use few), and kept once compiled.
+const scenePrograms = new Map();
+function sceneProgram(mask) {
+  let p = scenePrograms.get(mask);
+  if (!p) {
+    p = compile(VS, SCENE_FS.replace('#define MAXH', `const int FXMASK = ${mask};\n#define MAXH`));
+    gl.bindAttribLocation(p, 0, 'p'); gl.linkProgram(p);
+    scenePrograms.set(mask, p);
+  }
+  return p;
+}
+const P = {
+  scene: sceneProgram(0), meal: compile(MEAL_VS, MEAL_FS),
+  copy: compile(VS, COPY_FS), blur: compile(VS, BLUR_FS), comp: compile(VS, COMP_FS), taa: compile(VS, TAA_FS),
+};
+
+// Full-screen triangle.
+const triBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, triBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+const triVao = gl.createVertexArray();
+gl.bindVertexArray(triVao);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+for (const k of ['copy', 'blur', 'comp', 'taa']) { gl.bindAttribLocation(P[k], 0, 'p'); gl.linkProgram(P[k]); }
+
+// Mesh for swallowed windows: a 48x48 grid.
+const GRID = 48;
+const mealVao = gl.createVertexArray();
+gl.bindVertexArray(mealVao);
+{
+  const uv = [], idx = [];
+  for (let y = 0; y <= GRID; y++) for (let x = 0; x <= GRID; x++) uv.push(x / GRID, y / GRID);
+  for (let y = 0; y < GRID; y++) for (let x = 0; x < GRID; x++) {
+    const i = y * (GRID + 1) + x;
+    idx.push(i, i + 1, i + GRID + 1, i + 1, i + GRID + 2, i + GRID + 1);
+  }
+  gl.bindAttribLocation(P.meal, 1, 'aUV'); gl.linkProgram(P.meal);
+  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(uv), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 0, 0);
+  const e = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, e); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+}
+gl.bindVertexArray(null);
+
+function makeTex(w, h, internal, format, type, filter = gl.LINEAR) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+const brightFmt = floatTargets ? [gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT] : [gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE];
+let T = null;   // render targets, sized with the canvas (times rscale)
+// The ray tracing runs at rscale x the window's resolution. "Auto" lowers it a step when frames start dropping (a big
+// hole, several holes, a slow GPU) and raises it again when there's headroom; the anti-aliasing hides the difference.
+let rscale = 1, slowFrames = 0, fastFrames = 0;
+function makeTargets() {
+  if (T) { for (const t of T.texs) gl.deleteTexture(t); for (const f of T.fbos) gl.deleteFramebuffer(f); }
+  const W = Math.max(1, Math.round(canvas.width * rscale)), H = Math.max(1, Math.round(canvas.height * rscale)), w4 = Math.max(1, W >> 2), h4 = Math.max(1, H >> 2), w8 = Math.max(1, W >> 3), h8 = Math.max(1, H >> 3);
+  const color = makeTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+  const meal = makeTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+  const hist = [makeTex(W, H, ...brightFmt), makeTex(W, H, ...brightFmt)];
+  const bright = makeTex(W, H, ...brightFmt);
+  const a1 = makeTex(w4, h4, ...brightFmt), a2 = makeTex(w4, h4, ...brightFmt);
+  const b1 = makeTex(w8, h8, ...brightFmt), b2 = makeTex(w8, h8, ...brightFmt);
+  const fb = (...texs) => {
+    const f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    texs.forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t, 0));
+    return f;
+  };
+  T = { W, H, w4, h4, w8, h8, color, bright, a1, a2, b1, b2, meal, hist, histAt: 0, histOk: false,
+        scene: fb(color, bright), fa1: fb(a1), fa2: fb(a2), fb1: fb(b1), fb2: fb(b2), fmeal: fb(meal), fhist: [fb(hist[0]), fb(hist[1])],
+        texs: [color, bright, a1, a2, b1, b2, meal, ...hist] };
+  T.fbos = [T.scene, T.fa1, T.fa2, T.fb1, T.fb2, T.fmeal, ...T.fhist];
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// Dreams: each hole's memory (main.js sends a 128x80 picture per hole), packed side by side into one texture.
+const dreamTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, dreamTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 512, 80, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+const dreams = new Map(), dreamSlot = ['', '', '', ''];
+api.on('dream', (uid, px) => { dreams.set(uid, px instanceof Uint8Array ? px : new Uint8Array(px)); dreamSlot.fill(''); });
+function dreamSlots(vs) {
+  vs.forEach((v, i) => {
+    const px = dreams.get(v.h.uid);
+    if (!px || dreamSlot[i] === v.h.uid || px.length !== 128 * 80 * 4) return;
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, dreamTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, i * 128, 0, 128, 80, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    gl.activeTexture(gl.TEXTURE0);
+    dreamSlot[i] = v.h.uid;
+  });
+}
+
+// Wormhole: a picture of another monitor (main.js sends one every second or so while a hole has it on).
+const wormTex = gl.createTexture();
+let hasWorm = false;
+function uploadWorm(w, hh, pixels) {
+  gl.activeTexture(gl.TEXTURE2);
+  gl.bindTexture(gl.TEXTURE_2D, wormTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, hh, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.activeTexture(gl.TEXTURE0);
+  hasWorm = true;
+}
+api.on('worm', (w, hh, pixels) => uploadWorm(w, hh, pixels instanceof Uint8Array ? pixels : new Uint8Array(pixels)));
+
+// Desktop capture texture.
+let screenTexW = 0, screenTexH = 0;
+const screenTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, screenTex);
+for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR],
+                      // mirrored: strongly bent rays that look past the captured area see a reflection, not smeared edges
+                      [gl.TEXTURE_WRAP_S, gl.MIRRORED_REPEAT], [gl.TEXTURE_WRAP_T, gl.MIRRORED_REPEAT]])
+  gl.texParameteri(gl.TEXTURE_2D, k, v);
+
+let dpr = 1;
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(innerWidth * dpr));
+  canvas.height = Math.max(1, Math.round(innerHeight * dpr));
+  makeTargets();
+}
+addEventListener('resize', resize);
+resize();
+
+// =====================================================================================================
+//  State
+// =====================================================================================================
+const clock = () => performance.timeOrigin + performance.now();   // shared by every window and the main process
+const smooth = (a, b, x) => { const t = Math.min(Math.max((x - a) / (b - a), 0), 1); return t * t * (3 - 2 * t); };
+const clamp = (v, a) => Math.max(-a, Math.min(a, v));
+
+let ready = false, isLeader = false, isShare = false, settings = null, displays = [], paused = false;
+const origin = { x: 0, y: 0, width: 0, height: 0 };   // this view's top-left (and, for the share view, size), physical px
+let holes = [];                  // the leader's are authoritative; followers hold the latest copy
+let stamp = 0;                   // clock time of the followers' copy
+let pxScale = 1;                 // render px per screen px (share view)
+
+function iscoOf(a) {   // prograde ISCO for spin a (Bardeen-Press-Teukolsky), in Schwarzschild radii
+  const z1 = 1 + Math.cbrt(1 - a*a) * (Math.cbrt(1 + a) + Math.cbrt(1 - a));
+  const z2 = Math.sqrt(3*a*a + z1*z1);
+  return (3 + z2 - Math.sqrt((3 - z1) * (3 + z1 + 2*z2))) / 2;
+}
+const PRESETS = {
+  classic: { on: 1, outer: 10, alpha: 1, heat: 1 },
+  quiet:   { on: 0, outer: 10, alpha: 1, heat: 1 },     // no disk: just the bending
+  thin:    { on: 1, outer: 7, alpha: 0.55, heat: 0.85 },
+  blazing: { on: 1, outer: 11, alpha: 1, heat: 2.2 },
+};
+// Unlockable effects (Settings -> Unlocked looks), stored by name in the 'fx' list; the shader gets them as bits.
+const FX = ['jets', 'debris', 'photon', 'hawking', 'companion', 'ripples', 'pixel', 'spiral', 'clumpy', 'banded', 'warped',
+            'magnetic', 'glitch', 'white', 'wormhole', 'inverted', 'dust', 'stars', 'snow'];
+const FXB = Object.fromEntries(FX.map((id, i) => [id, 1 << i]));
+const fxBitsOf = list => (Array.isArray(list) ? list : []).reduce((b, id) => b | (FXB[id] || 0), 0);
+// A hole's look: the global settings, with anything set for that hole on top.
+function lookOf(h) {
+  const s = { ...settings, ...(h.overrides || {}) };
+  if (settings.reduceMotion) s.fx = (s.fx || []).filter(id => id !== 'ripples' && id !== 'glitch');   // Reduce motion: nothing that shakes
+  if (h.rare === 'albino') { s.diskColor = '#eef3ff'; s.diskTemp = Math.max(+s.diskTemp || 0, 0.8); }
+  if (h.rare) s.fx = [...(s.fx || []), { twin: 'jets', ringed: 'banded', glimmer: 'photon' }[h.rare]].filter(Boolean);
+  if (h.rare === 'speedy') s.spinSpeed = (+s.spinSpeed || 1) * 2.2;
+  // Named Gargantua: always the film's look, a thin, bright, gold-white disk with no beaming, nearly at maximum spin.
+  if (/^gargantua$/i.test((h.name || '').trim())) Object.assign(s, { look: 'classic', diskColor: '#ffd29a', diskTemp: 0.85, thickness: 0.012, tilt: 3, bloom: 0.8, dopplerColor: false, grade: 'natural', fx: [] });
+  const pr = PRESETS[s.look] || PRESETS.classic;
+  const hex = /^#?([0-9a-f]{6})$/i.exec(s.diskColor || '')?.[1] || 'ff280a';
+  const c = [0, 2, 4].map(i => parseInt(hex.slice(i, i + 2), 16) / 255);
+  const mx = Math.max(...c, 1e-3);
+  const a = /^gargantua$/i.test((h.name || '').trim()) ? 0.99 : Math.min(Math.max(+(h.spin ?? s.bhSpin) || 0, 0), 0.998);   // each hole's own spin (it builds up as it eats)
+  return {
+    ...pr, coef: c.map(v => 2.6 * v / mx), heat: pr.heat * (0.4 + 1.2 * s.diskTemp),
+    omega: 5 * s.spinSpeed, spin: a, isco: iscoOf(a), horizon: (1 + Math.sqrt(1 - a*a)) / 2,
+    thickness: Math.max(0, +s.thickness || 0), tilt: (+s.tilt || 0) * Math.PI / 180,
+    star: s.einsteinStar ? 1 : 0, fxBits: fxBitsOf(s.fx), castShadow: s.castShadow !== false,
+    grade: Math.max(0, ['natural', 'filmic', 'warm', 'falsecolor', 'mono'].indexOf(s.grade)), doppler: s.dopplerColor === false ? 0 : 1, retroSkin: !!s.retroSkin || fxBitsOf(s.fx) & FXB.pixel,
+  };
+}
+
+// Names: real black holes.
+const NAMES = ['Cygnus X-1', 'Sagittarius A*', 'M87*', 'V404 Cygni', 'Gaia BH1', 'TON 618', 'GRS 1915', 'A0620-00',
+               'Phoenix A', 'Holmberg 15A', 'GW150914', 'Gaia BH3'];
+const freshName = () => NAMES.find(n => !holes.some(h => h.name === n)) || `Black hole ${holes.length + 1}`;
+
+// Spin from feeding. Gas falls in from the innermost stable orbit carrying that orbit's energy E and angular momentum L
+// (per unit mass), so the hole's spin changes as da/d(ln M) = L/E - 2a (Bardeen 1970). Starting from no spin it reaches
+// a = 1 after growing by sqrt(6) in mass; radiation the hole swallows caps it at 0.998 (Thorne 1974).
+function spinUp(h, dm) {
+  let a = h.spin ?? +settings.bhSpin ?? 0;
+  const steps = 16, dl = Math.log(1 + dm / Math.max(h.mass, 0.1)) / steps;
+  for (let i = 0; i < steps; i++) {
+    const r = iscoOf(Math.min(a, 0.998)) * 2;   // ISCO in units of M
+    const E = Math.sqrt(1 - 2 / (3 * r)), L = 2 / (3 * Math.sqrt(3)) * (1 + 2 * Math.sqrt(3 * r - 2));
+    a = Math.min(a + (L / E - 2 * a) * dl, 0.998);
+  }
+  h.spin = a;
+}
+
+// Mood: from hunger, excitement, sleepiness, petting, music and so on, shown only in how it looks and moves.
+function moodOf(h) {
+  const sleep = h.sleep || 0, ex = h.excite || 0, ap = h.appetite ?? 0.3, purr = h.purr || 0, dance = h.dance || 0;
+  const lazy = h.trait === 'lazy' ? 1 : 0, focus = h.focus || 0;
+  return {
+    // hungry, excited, petted: brighter; asleep or sulking, dimmer. And the more it has eaten lately, the brighter it burns.
+    heat: (1 + 0.3 * ap + 0.5 * ex + 0.25 * purr) * (1 - 0.45 * sleep) * (1 + 0.4 * (h.groom || 0)) * (h.fear === 'the dark' ? 1 + 0.4 * (h.scared || 0) : 1 - 0.3 * (h.scared || 0)) * (h.sulking ? 0.75 : 1) * (1 + 0.8 * (h.accr || 0) / ((h.accr || 0) + 0.1)),
+    omega: (1 + 0.25 * ap + 0.6 * ex) * (1 - 0.6 * sleep) * (1 - 0.25 * purr) * (1 - 0.15 * lazy) * (h.sulking ? 0.8 : 1),
+    wobble: settings?.reduceMotion ? 0 : Math.max(0.15, (1 + 2.5 * ex - 0.7 * sleep - 0.5 * purr) * (1 - 0.4 * lazy) * (1 - 0.6 * focus)) + 3 * (h.nausea || 0),
+    label: (h.park || 0) > 0.5 ? 'parked' : h.floating ? 'floating' : (h.scared || 0) > 0.5 ? 'scared' : (h.jealous || 0) > 0.6 ? 'jealous' : h.sulking ? 'sulking' : clock() < (h.hicUntil || 0) ? 'hiccups' : (h.nausea || 0) > 0.3 ? 'queasy' : purr > 0.4 ? 'purring' : dance > 0.4 ? 'dancing'
+         : sleep > 0.5 ? 'sleepy' : ap > 0.75 ? 'hungry' : ex > 0.35 ? 'excited' : (h.bored || 0) > 0.5 ? 'bored'
+         : focus > 0.6 ? 'quiet' : ap < 0.25 ? 'content' : 'calm',
+  };
+}
+
+// Personality, picked at birth and kept for life.
+//   greedy: gets hungry faster and is harder to fill   shy: backs away from a cursor that rushes at it (until it trusts you)
+//   lazy: dozes easily, moves and turns less           playful: bored sooner, coasts further when thrown
+//   clingy: ambles over to wherever the cursor rests
+const TRAITS = ['greedy', 'shy', 'lazy', 'playful', 'clingy'];
+// Rare traits, about one birth in fifty: a white-hot disk, jets from birth, a disk that whirls, rings, a glowing edge.
+const RARES = ['albino', 'twin', 'speedy', 'ringed', 'glimmer'];
+const RARE_TEXT = { albino: 'An albino: its disk burns white.', twin: 'Born with twin jets.', speedy: 'Its disk whirls twice as fast.',
+                    ringed: 'Born with rings.', glimmer: 'Its photon sphere glows.' };
+// Food quality: how filling and how pleasing something is.
+const QUALITY = { rich: { fill: 1.6, joy: 1.4, word: 'Rich.' }, hearty: { fill: 1.3, joy: 1.2, word: 'Hearty.' }, plain: { fill: 1, joy: 1 },
+                  snack: { fill: 0.6, joy: 0.9 }, unsatisfying: { fill: 0.2, joy: 0.3, word: 'Unsatisfying.' } };
+const EDD = 0.6;   // Eddington limit: more than this (times its mass) eaten within a minute or two, and the rest is blown back
+// Its favourite food: whatever it has eaten most of (at least three), by kind.
+const favouriteOf = h => { const [k, n] = Object.entries(h.tastes || {}).sort((a, b) => b[1] - a[1])[0] || []; return n >= 3 ? k : null; };
+const MOOD_SOUNDS = ['jealous', 'sulking', 'scared', 'sleepy', 'hungry', 'excited', 'queasy', 'bored', 'content', 'floating'];
+const FEARS = ['bright windows', 'the dark', 'bigger black holes', 'loud music'];
+const HOBBY_TEXT = { music: 'music', cuddles: 'cuddles', stargazing: 'stargazing' };
+let song = '';   // 'space oddity' while that's playing anywhere on the PC
+const UPGRADE = { unsatisfying: 'snack', snack: 'plain', plain: 'hearty', hearty: 'rich', rich: 'rich' };
+const falling = new Map();   // key -> { owner (hole id), start }: things still falling in (another hole can steal them)
+const newUid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+const shadowR = h => 2.6 * rsPx(h);   // the shadow's radius, roughly, in px
+const trimTree = (n, d = 3) => n && { n: n.n, b: n.b, p: d > 0 ? (n.p || []).map(x => trimTree(x, d - 1)).filter(Boolean) : [] };
+const petEvent = (h, e) => api.send('pet-event', { holeId: h?.id, ...e });
+const sentAch = new Set();
+const achieveOnce = (h, id, e = {}) => { if (!sentAch.has(id)) { sentAch.add(id); petEvent(h, { achieve: id, ...e }); } };
+let cursorPt = null, cursorV = 0, cursorVX = 0, cursorVY = 0, cursorMovedAt = 0;   // from main, ~30 times a second
+let focus = 0, typingRate = 0, lastTypingAt = 0;   // typing a lot: it keeps still and quiet
+let fullscreenRect = null;                           // a fullscreen game or video: [l, t, r, b]
+let previewDemo = false;
+let journalAt = 0;                             // icon mode, rendering a Settings preview
+let music = { on: 0, beat: false }, ownSoundUntil = 0;   // (the music listener ignores our own sounds)
+
+const rsPx = h => K * h.mass * settings.size * h.dpr;     // Schwarzschild radius in physical px
+const rsBase = h => K * settings.size * h.dpr;            // the same without the scroll-wheel mass
+function deathState(h, t) {
+  // A black hole's lifetime scales with mass cubed, so mass goes as (1 - t/T)^(1/3): slow at first, then a plunge.
+  // Temperature goes as 1/M and power as 1/M^2, so it heats up and brightens as it shrinks, and the last of it
+  // leaves as a burst of radiation. The disk, held less tightly, spirals outward. All of it is in the shader.
+  const born = smooth(0, BORN, (t - (h.appear ?? h.born)) / 1000);
+  if (!h.deathAt) return { mass: 1, hawkOn: 0, burst: -1, fade: born };
+  const e = (t - h.deathAt) / 1000, s = Math.min(e / EVAPORATE, 1);
+  return {
+    mass: Math.cbrt(1 - s), hawkOn: smooth(0, 0.1, s), burst: e > EVAPORATE ? e - EVAPORATE : -1,
+    fade: born * (1 - smooth(EVAPORATE + BURST - FADE, EVAPORATE + BURST, e)),
+  };
+}
+// Where each hole is right now (followers extrapolate the leader's last state by its velocity).
+function views(t) {
+  const age = isLeader ? 0 : Math.min(Math.max((t - stamp) / 1000, 0), 0.05);
+  return holes.slice(0, MAXH).map(h => {
+    const d = deathState(h, t);
+    let jx = 0, jy = 0;
+    if (lookOf(h).fxBits & FXB.glitch) {
+      const k = Math.floor(t / 80), r = n => { const s = Math.sin(n) * 43758.5453; return s - Math.floor(s); };
+      if (r(k * 12.9898 + h.id * 78.233) > 0.9) { jx = (r(k * 4.1 + h.id) - 0.5) * 22; jy = (r(k * 7.7 + h.id) - 0.5) * 8; }
+    }
+    return {
+      h, x: h.x + h.vx * age + (settings?.reduceMotion ? 0 : (h.sway || 0) * 2.6 * rsPx(h) * 0.16) + jx, y: h.y + h.vy * age + jy, rs: rsPx(h), ...d,
+      fade: d.fade * (1 - 0.85 * (h.ghost || 0)) * (1 - 0.8 * (h.park || 0)),   // Alt: see through it; parked: dim
+      feed: h.feed >= 0 ? h.feed + age : -1, wave: h.wave >= 0 ? h.wave + age : -1, tde: h.tde >= 0 ? h.tde + age : -1,
+    };
+  });
+}
+
+// =====================================================================================================
+//  Leader: physics for every hole
+// =====================================================================================================
+const POS_K = 170, POS_DAMP = 2 * 0.62 * Math.sqrt(POS_K);     // drag spring: slightly underdamped, small overshoot
+const TILT_K = 80, TILT_DAMP = 2 * 0.32 * Math.sqrt(TILT_K);   // lean spring: sways a couple of times, then settles
+const G = 1.5e7, SOFT2 = 150 * 150;   // pull between holes (px^3/s^2 per unit mass), softened up close
+const FRICTION = 1.6;                 // 1/s: how quickly a thrown hole coasts to a stop
+let boredAfter = 3600;                // seconds left alone before a hole gets bored (main.js can shorten it for tests)
+let drag = null;                      // { id, off, last, cand: {key, rect, title, since}, probeAt }
+let nextId = 1, hadHoles = false;
+const events = [];                    // sounds to play this frame (leader)
+// Binaries: two holes that come close lock into orbit and spiral in. Gravitational waves carry off orbital energy, so
+// the separation obeys da/dt ~ -1/a^3: a^4 shrinks linearly in time and the pair merges after INSPIRAL seconds.
+// The orbit runs at the Kepler rate for its separation (w ~ a^-1.5), so it whirls faster and faster: the chirp.
+const INSPIRAL = 5.5;                 // seconds from locking into orbit to merging
+let binaries = [];                    // { a, b (hole ids), com: {x, y}, vcom: {x, y}, a0, sep, phi, dir, w0, t }
+
+// Monitors black holes may be on (Settings -> System -> Monitors); if every one is ruled out, all of them.
+const allowedDisplays = () => { const a = displays.filter(d => settings?.monitorRules?.[d.id]?.allow !== false); return a.length ? a : displays; };
+function displayAt(x, y) {
+  return displays.find(d => x >= d.phys.x && x < d.phys.x + d.phys.width && y >= d.phys.y && y < d.phys.y + d.phys.height);
+}
+function newHole(x, y, mass = 1, overrides = {}, saved = {}) {
+  // Slow evaporation (if switched on) carries on while the app is closed: 2% a day after three days unfed.
+  if (settings.evaporate && saved.savedAt && saved.lastFed) {
+    const days = t0 => Math.max(0, (t0 - saved.lastFed) / 86400e3 - 3);
+    mass = Math.max(0.3, mass * Math.pow(0.98, days(Date.now()) - days(saved.savedAt)));
+  }
+  const o = {
+    // Who it is: kept between launches.
+    name: saved.name || freshName(), born: saved.born || clock(), spin: saved.spin ?? +settings.bhSpin,
+    appetite: saved.appetite ?? 0.3, excite: 0, sleep: 0, mood: 'calm', appear: clock(),
+    id: nextId++, x, y, vx: 0, vy: 0, tx: x, ty: y, mass, massTarget: mass, dpr: displayAt(x, y)?.scale || 1,
+    tiltx: 0, tilty: 0, tvx: 0, tvy: 0, feed: -1, wave: -1, tde: -1, ghost: 0, ghostOn: false, hunger: 0,
+    deathAt: 0, overrides: { ...overrides }, meals: [],
+    retro: 0, pulse: 0, touched: clock(), bored: 0, boredAt: 0, boredTarget: null,
+    // Pet data, kept between launches (main.js PET_KEYS).
+    uid: saved.uid || newUid(), trait: TRAITS.includes(saved.trait) ? saved.trait : TRAITS[Math.random() * TRAITS.length | 0],
+    pinned: !!saved.pinned, bonds: { ...(saved.bonds || {}) }, parentUid: saved.parentUid || null, baby: !!saved.baby,
+    lineage: saved.lineage || null, children: saved.children || [], trophies: saved.trophies || [],
+    stats: { eaten: 0, petS: 0, danceS: 0, ...(saved.stats || {}) }, trust: saved.trust || 0,
+    // Moment to moment.
+    purr: 0, petAcc: 0, petAng: null, nausea: 0, shake: [], shakeSign: 0, dance: 0, beat: 0, sway: 0, swayDir: 1,
+    park: 0, parked: false, parkTo: null, parkFrom: null, focus: 0, handled: 0, walk: false, flinchAt: 0,
+    lastFed: saved.lastFed || clock(), lastTouch: saved.lastTouch || clock(), sulking: !!saved.sulking,
+    rare: RARES.includes(saved.rare) ? saved.rare : ('rare' in saved || saved.uid) ? null : Math.random() < 1 / 50 ? RARES[Math.random() * RARES.length | 0] : null,
+    accr: 0, wind: 0, yawn: 0, yawnAt: 0, hic: 0, hicAt: 0, hicUntil: 0, dream: 0, playAt: 0, boredKey: null,
+    // Fears (about four in ten have one), and a hobby it picks up from how it spends its time.
+    fear: 'fear' in saved ? (FEARS.includes(saved.fear) ? saved.fear : null) : Math.random() < 0.4 ? FEARS[Math.random() * FEARS.length | 0] : null,
+    hobby: typeof saved.hobby === 'string' ? saved.hobby : null,
+    scared: 0, fleeAng: 0, light: 0.5, jealous: 0, lastPet: 0, groom: 0, groomAt: clock(), floating: false, shakeY: [], shakeSignY: 0, path: null,
+    tastes: { ...(saved.tastes || {}) },   // kind of food -> how many it has eaten (the most eaten becomes its favourite)
+    rivals: { ...(saved.rivals || {}) },   // hole uid -> how many times they've stolen from each other (3+: rivals)
+  };
+  o.lineage ||= { n: o.name, b: o.born, p: [] };
+  return o;
+}
+function adopt(state) {
+  holes = (state?.holes || []).map(h => ({ ...h, tx: h.x, ty: h.y, massTarget: h.massTarget ?? h.mass }));
+  nextId = holes.reduce((m, h) => Math.max(m, h.id + 1), 1);
+  hadHoles = holes.length > 0;
+  drag = null;
+}
+function spawnFirst() {
+  for (const s of (settings.lastHoles || []).slice(0, MAXH)) if (displayAt(s.x, s.y)) holes.push(newHole(s.x, s.y, s.mass || 1, s.overrides || {}, s));
+  if (!holes.length) {
+    const d = allowedDisplays().find(d => d.primary) || allowedDisplays()[0];
+    holes.push(newHole(d.phys.x + d.phys.width / 2, d.phys.y + d.phys.height / 2));
+  }
+  hadHoles = true;
+}
+
+// Thrown holes bounce off screen edges that have no monitor beyond them.
+function keepOnScreen(h) {
+  const here = displayAt(h.x, h.y);
+  if ((here && allowedDisplays().includes(here)) || !displays.length) return;
+  let best = null, bd = Infinity;
+  for (const d of allowedDisplays()) {
+    const cx = Math.min(Math.max(h.x, d.phys.x), d.phys.x + d.phys.width - 1);
+    const cy = Math.min(Math.max(h.y, d.phys.y), d.phys.y + d.phys.height - 1);
+    const dd = (cx - h.x) ** 2 + (cy - h.y) ** 2;
+    if (dd < bd) { bd = dd; best = { cx, cy }; }
+  }
+  if (best.cx !== h.x) { h.vx = -h.vx * 0.6; h.x = best.cx; }
+  if (best.cy !== h.y) { h.vy = -h.vy * 0.6; h.y = best.cy; }
+  h.tx = h.x; h.ty = h.y;
+}
+
+// Holes pull on each other (and can pair up and merge) only while one of them is being handled or was just thrown.
+// Left to themselves they get along, or don't: see wantWalk.
+const handledLately = (x, t) => drag?.id === x.id || t - (x.handled || 0) < 8000;
+const pulls = (a, b, t) => handledLately(a, t) || handledLately(b, t);
+// A herd: this hole's circle of friends (friends of friends count), if it's three or more.
+function herdOf(h) {
+  const seen = new Set([h]), todo = [h];
+  while (todo.length) { const a = todo.pop(); for (const o of holes) if (!seen.has(o) && !o.deathAt && (a.bonds[o.uid] || 0) >= 1) { seen.add(o); todo.push(o); } }
+  return seen.size >= 3 ? [...seen] : null;
+}
+function toward(h, gx, gy, speed, stop = 4) {
+  const dx = gx - h.x, dy = gy - h.y, d = Math.hypot(dx, dy);
+  if (d <= stop) return [0, 0];
+  const s = Math.min(speed, (d - stop) * 1.2);   // eases in to a stop without overshooting
+  return [dx / d * s, dy / d * s];
+}
+// Where a hole wants to amble on its own, as a velocity (px/s), or null to just coast.
+function wantWalk(h, t, bored, inBinary) {
+  if (h.deathAt || drag?.id === h.id || inBinary.has(h.id)) return null;
+  // Following a path you drew (Ctrl + drag): along it, eating whatever the path ran into.
+  if (h.path) {
+    const P = h.path, p = P.pts[P.i];
+    if (!p) { h.path = null; return [0, 0]; }
+    if (Math.hypot(p[0] - h.x, p[1] - h.y) < 16) {
+      P.i++;
+      for (const e of P.eats) if (!e.done && e.at <= P.i) { e.done = true; api.send('eat', h.id, e.key, e.rect, e.title); }
+      if (P.i >= P.pts.length) { h.path = null; return [0, 0]; }
+    }
+    // full speed along the way, easing in only at the end
+    const q = P.pts[P.i], dx = q[0] - h.x, dy = q[1] - h.y, d = Math.hypot(dx, dy) || 1, last = P.i === P.pts.length - 1;
+    const sp = last ? Math.min(340, d * 2) : 340;
+    return [dx / d * sp, dy / d * sp];
+  }
+  if (h.pinned || t - (h.handled || 0) < 2500) return null;
+  const R = shadowR(h);
+  // A fullscreen game or video on its monitor: tuck into the nearest corner, and come back after.
+  if (h.parkTo) return toward(h, h.parkTo[0], h.parkTo[1], 260, 2);
+  if (h.parkFrom) { const w = toward(h, h.parkFrom[0], h.parkFrom[1], 260, 3); if (!w[0] && !w[1]) h.parkFrom = null; return w; }
+  if (h.focus > 0.6) return null;   // you're typing: it keeps still
+  // Scared: away from a bigger hole, or off somewhere else (from a bright window).
+  if ((h.scared || 0) > 0.5 && h.fear !== 'the dark' && h.fear !== 'loud music') {
+    const a = h.fleeFrom ? Math.atan2(h.y - h.fleeFrom.y, h.x - h.fleeFrom.x) : h.fleeAng;
+    return [Math.cos(a) * 90, Math.sin(a) * 90];
+  }
+  // Floating off to Space Oddity: up toward the top of its monitor, swaying a little.
+  if (h.floating) { const d = displayAt(h.x, h.y) || allowedDisplays()[0]; return [Math.sin(t / 2300) * 14, h.y > d.phys.y + R * 1.6 ? -22 : 0]; }
+  // Jealous: comes over to the cursor for attention.
+  if ((h.jealous || 0) > 0.6 && cursorPt) return toward(h, cursorPt.x, cursorPt.y, 70, R * 3);
+  // Herds: three or more friends move about together, following the heaviest at an easy amble.
+  const herd = herdOf(h);
+  if (herd) {
+    const lead = herd.reduce((a, b) => b.mass > a.mass ? b : a);
+    if (lead === h) {
+      const d = displayAt(h.x, h.y) || allowedDisplays()[0], k = Math.floor(t / 40000);
+      const rnd = n => { const s = Math.sin(n) * 43758.5453; return s - Math.floor(s); };
+      return toward(h, d.phys.x + d.phys.width * (0.2 + 0.6 * rnd(k * 12.9 + 1)), d.phys.y + d.phys.height * (0.25 + 0.5 * rnd(k * 78.2 + 2)), 30, 20);
+    }
+    const idx = herd.filter(o => o !== lead).sort((a, b) => a.id - b.id).indexOf(h), ang = idx * 2.4 + 2.2, D = 1.8 * (R + shadowR(lead));
+    return toward(h, lead.x + Math.cos(ang) * D, lead.y + Math.sin(ang) * D * 0.7, 60, 6);
+  }
+  // Hobbies: a stargazer drifts up to the top of the screen at night to look at the sky; a cuddler comes to the cursor.
+  const hour = new Date().getHours();
+  if (h.hobby === 'stargazing' && (hour >= 21 || hour < 6) && (h.sleep || 0) < 0.5) {
+    const d = displayAt(h.x, h.y) || allowedDisplays()[0];
+    return toward(h, h.x, d.phys.y + R * 1.8, 20, 6);
+  }
+  if (h.hobby === 'cuddles' && cursorPt && t - cursorMovedAt > 3000 && Math.hypot(cursorPt.x - h.x, cursorPt.y - h.y) > R * 4.5) return toward(h, cursorPt.x, cursorPt.y, 40, R * 4);
+  // A baby stays close to its parent.
+  const parent = h.baby && holes.find(o => o.uid === h.parentUid && !o.deathAt);
+  if (parent) { const R2 = R + shadowR(parent), side = h.x >= parent.x ? 1 : -1; return toward(h, parent.x + side * R2 * 1.5, parent.y + R2 * 0.4, 160, 6); }
+  if (cursorPt) {
+    const dc = Math.hypot(cursorPt.x - h.x, cursorPt.y - h.y) || 1;
+    if (h.trait === 'shy' && (h.trust || 0) < 1 && dc < R * 3.2 && cursorV > 350 && h.purr < 0.2)
+      return [(h.x - cursorPt.x) / dc * 110, (h.y - cursorPt.y) / dc * 110];
+    if (h.trait === 'clingy' && !bored && t - cursorMovedAt > 2000 && dc > R * 4.5 && allowedDisplays().includes(displayAt(cursorPt.x, cursorPt.y)))
+      return toward(h, cursorPt.x, cursorPt.y, 45, R * 4);
+  }
+  // Other holes: friends drift into a lazy orbit around each other; strangers keep their distance.
+  for (const o of holes) {
+    if (o === h || o.deathAt || pulls(h, o, t)) continue;
+    if ((h.baby && o.uid === h.parentUid) || (o.baby && o.parentUid === h.uid)) continue;
+    const dx = h.x - o.x, dy = h.y - o.y, d = Math.hypot(dx, dy) || 1, D = 1.7 * (R + shadowR(o)), bond = h.bonds[o.uid] || 0;
+    if (bond >= 1 && d < D * 4) { const k = clamp((D - d) * 0.6, 40); return [dx / d * k - dy / d * 22, dy / d * k + dx / d * 22]; }
+    if ((h.rivals[o.uid] || 0) >= 3 && d < D * 3.5) return [dx / d * 45, dy / d * 45];   // rivals keep well apart
+    if (bond < 0.3 && d < D * 1.5) return [dx / d * 28, dy / d * 28];
+  }
+  if (bored && h.boredTarget) {   // left alone for ages: over to the nearest window, the shadow just touching it
+    const [l, tp, r, b] = h.boredTarget, pad = R * 1.6;
+    return toward(h, Math.min(Math.max(h.x, l - pad), r + pad), Math.min(Math.max(h.y, tp - pad), b + pad), 28, 4);
+  }
+  return null;
+}
+// Shaken hard back and forth: it goes a little green and brings up the last thing it ate.
+function queasy(h) {
+  h.nausea = 1;
+  achieveOnce(h, 'shaken');
+  setTimeout(() => { const last = h.meals[h.meals.length - 1]; if (last && holes.includes(h)) onInput({ type: 'release-one', id: h.id, key: last.key }); }, 600);
+}
+// A big meal sometimes leaves a little one behind, which follows its parent around until it's grown.
+function maybeBaby(p, big) {
+  if (big < 0.15 || p.baby || p.deathAt || p.mass < 0.8 || holes.length >= MAXH || Math.random() > 0.3) return;
+  if (holes.some(o => o.baby && o.parentUid === p.uid && !o.deathAt)) return;   // one at a time
+  let name = `${p.name.split(/[\s-]/)[0]} Jr.`;
+  if (holes.some(o => o.name === name)) name = freshName();
+  const R = shadowR(p);
+  const kid = newHole(p.x + R * 2, p.y + R * 0.5, 0.3, { ...p.overrides }, { name, baby: true, parentUid: p.uid,
+    trait: Math.random() < 0.6 ? p.trait : undefined, ...(p.rare && Math.random() < 0.3 ? { rare: p.rare } : {}), lineage: { n: name, b: clock(), p: [{ n: p.name, b: p.born, p: [] }] } });
+  kid.bonds[p.uid] = 1; p.bonds[kid.uid] = 1;
+  kid.vx = 240;
+  p.children = [...(p.children || []), { n: name, b: kid.born, p: [] }].slice(-12);
+  holes.push(kid);
+  announceRare(kid);
+  events.push({ type: 'gulp', mass: 0.3 });
+  petEvent(p, { achieve: 'baby', text: `${p.name} had a baby.`, sub: `Say hello to ${name}.` });
+}
+// Trophies: the most remarkable thing of each kind it has eaten.
+const BETTER = { biggest: (a, b) => a.v > b.v, heaviest: (a, b) => a.v > b.v, oldest: (a, b) => a.v < b.v, model: (a, b) => a.v > b.v, archive: (a, b) => a.v > b.v };
+function addTrophy(h, tr) {
+  const i = h.trophies.findIndex(x => x.kind === tr.kind);
+  if (i < 0) h.trophies = [...h.trophies, tr].slice(0, 12);
+  else if (BETTER[tr.kind]?.(tr, h.trophies[i])) h.trophies = h.trophies.map((x, j) => j === i ? tr : x);
+}
+// A fullscreen game or video started or stopped: holes on that monitor park in a corner and dim.
+function park() {
+  for (const h of holes) {
+    const r = fullscreenRect;
+    if (r && !h.deathAt && h.x >= r[0] && h.x < r[2] && h.y >= r[1] && h.y < r[3]) {
+      if (!h.pinned && !h.parkTo && drag?.id !== h.id) {
+        const R = shadowR(h) * 1.25;
+        h.parkFrom ||= [h.x, h.y];
+        h.parkTo = [h.x < (r[0] + r[2]) / 2 ? r[0] + R : r[2] - R, h.y < (r[1] + r[3]) / 2 ? r[1] + R : r[3] - R];
+      }
+      h.parked = true;
+    } else { h.parkTo = null; h.parked = false; }
+  }
+}
+
+function physics(dt) {
+  const t = clock();
+  const typing = t - lastTypingAt < 4000 && typingRate > 2.5;
+  focus += ((typing ? 1 : 0) - focus) * Math.min(1, dt * (typing ? 1.2 : 0.25));
+  const inBinary = new Set();
+  for (const B of binaries) {
+    const A = holes.find(h => h.id === B.a), C = holes.find(h => h.id === B.b);
+    // Grabbing either hole (or one starting to evaporate) breaks the pair; they keep their orbital speeds.
+    if (!A || !C || A.deathAt || C.deathAt || drag?.id === A.id || drag?.id === C.id) { B.dead = true; continue; }
+    B.t += dt;
+    const M = A.mass + C.mass;
+    const merge = 2.6 * (rsPx(A) + rsPx(C)) * 0.6 * 0.9;   // a little inside where the merge happens
+    B.sep = Math.max(B.a0 * Math.pow(Math.max(1 - B.t / INSPIRAL, 0), 0.25), merge);
+    const w = B.w0 * Math.pow(B.a0 / B.sep, 1.5);
+    B.phi += B.dir * w * dt;
+    B.f = w / Math.PI;   // gravitational-wave frequency: twice the orbital frequency
+    // The pair's centre of mass coasts on like a single body.
+    B.vcom.x -= FRICTION * B.vcom.x * dt; B.vcom.y -= FRICTION * B.vcom.y * dt;
+    B.com.x += B.vcom.x * dt; B.com.y += B.vcom.y * dt;
+    const ux = Math.cos(B.phi), uy = Math.sin(B.phi);
+    for (const [h, s] of [[A, C.mass / M], [C, -A.mass / M]]) {
+      const nx = B.com.x + s * B.sep * ux, ny = B.com.y + s * B.sep * uy;
+      h.vx = (nx - h.x) / dt; h.vy = (ny - h.y) / dt;
+      h.x = nx; h.y = ny; h.tx = nx; h.ty = ny;
+      inBinary.add(h.id);
+    }
+  }
+  binaries = binaries.filter(B => !B.dead);
+  for (const h of holes) {
+    h.mass += (h.massTarget - h.mass) * Math.min(1, dt * 8);
+    // Size follows the display scaling of the monitor it's on, easing across a seam instead of jumping.
+    const d = displayAt(h.x, h.y);
+    if (d) h.dpr += (d.scale - h.dpr) * Math.min(1, dt * 5);
+    let ax = 0, ay = 0;
+    if (inBinary.has(h.id)) { /* moved by its binary above */ }
+    else if (drag?.id === h.id) {
+      ax = POS_K * (h.tx - h.x) - POS_DAMP * h.vx;
+      ay = POS_K * (h.ty - h.y) - POS_DAMP * h.vy;
+    } else {
+      // Free flight: keeps the momentum it was thrown with and coasts down (unless it's ambling somewhere), and falls
+      // toward other holes while you're handling them.
+      const fr = h.trait === 'playful' ? 1.0 : FRICTION;
+      ax = h.walk ? 0 : -fr * h.vx; ay = h.walk ? 0 : -fr * h.vy;
+      for (const o of holes) {
+        if (o === h || o.deathAt || !pulls(h, o, t)) continue;
+        const dx = o.x - h.x, dy = o.y - h.y, d2 = dx*dx + dy*dy + SOFT2;
+        const f = G * o.mass / (d2 * Math.sqrt(d2));
+        ax += dx * f; ay += dy * f;
+      }
+    }
+    if (!inBinary.has(h.id)) {
+      h.vx += ax * dt; h.vy += ay * dt;
+      const sp = Math.hypot(h.vx, h.vy);
+      if (!(sp < 20000)) { const k = sp > 0 && Number.isFinite(sp) ? 20000 / sp : 0; h.vx *= k; h.vy *= k; }   // (a safety net)
+      h.x += h.vx * dt; h.y += h.vy * dt;
+      if (drag?.id !== h.id) keepOnScreen(h);
+    }
+    const bored = !h.deathAt && drag?.id !== h.id && !inBinary.has(h.id) && !h.pinned
+               && t - (h.touched || t) > boredAfter * 1000 * (h.trait === 'playful' ? 0.5 : h.trait === 'lazy' ? 2 : 1);
+    // The cursor: it leans a little toward it when idle, flinches from a lunge, and purrs if you slowly circle its edge.
+    let leanX = 0, leanY = 0;
+    h.focus = focus;
+    if (cursorPt && drag?.id !== h.id && !h.deathAt) {
+      const R = shadowR(h), dx = cursorPt.x - h.x, dy = cursorPt.y - h.y, dc = Math.hypot(dx, dy) || 1;
+      if (Math.hypot(h.vx, h.vy) < 40 && focus < 0.6 && dc < R * 14) {
+        const pull = 0.07 * Math.min(1, dc / (R * 2)) * Math.max(0, 1 - dc / (R * 14));
+        leanX = dx / dc * pull; leanY = dy / dc * pull;
+        if (h.sulking) { leanX = -leanX; leanY = -leanY; }   // turns its back on you
+      }
+      if (cursorV > 2500 && dc < R * 5 && -(cursorVX * dx + cursorVY * dy) / dc > 1800 && t - h.flinchAt > 1500) {
+        h.flinchAt = t; h.tvx -= dx / dc * 2.5; h.tvy -= dy / dc * 2.5;
+      }
+      if (dc > R * 1.05 && dc < R * 3.5 && cursorV > 30 && cursorV < 1200) {
+        const ang = Math.atan2(dy, dx);
+        if (h.petAng != null) { let da = ang - h.petAng; da -= Math.round(da / (2 * Math.PI)) * 2 * Math.PI; h.petAcc += Math.abs(da); }
+        h.petAng = ang;
+      } else h.petAng = null;
+    }
+    h.petAcc *= Math.exp(-dt / 3);
+    const petting = h.petAcc > Math.PI * (h.hobby === 'cuddles' ? 1.0 : 1.6) && !h.sulking;   // circling at least once every few seconds (not while sulking)
+    h.purr += ((petting ? 1 : 0) - h.purr) * Math.min(1, dt * (petting ? 1.5 : 0.6));
+    if (petting) {
+      h.touched = t; h.lastTouch = t; h.sleep = 0; h.trust = Math.min(3, (h.trust || 0) + dt / 300); h.stats.petS += dt;
+      if (h.stats.petS >= 60) achieveOnce(h, 'purr');
+    }
+    // Shaking: count hard reversals while you drag it.
+    if (drag?.id === h.id) {
+      const sx = Math.sign(h.vx);
+      if (Math.abs(h.vx) > 900 && sx !== h.shakeSign) { h.shakeSign = sx; h.shake.push(t); }
+      if (h.shake.length) h.shake = h.shake.filter(s => t - s < 1600);
+      if (h.shake.length >= 6 && t - (h.queasyAt || 0) > 5000) { h.queasyAt = t; h.shake = []; queasy(h); }
+      const sy = Math.sign(h.vy);
+      if (Math.abs(h.vy) > 900 && sy !== h.shakeSignY) { h.shakeSignY = sy; h.shakeY.push(t); }
+      if (h.shakeY.length) h.shakeY = h.shakeY.filter(s => t - s < 1600);
+      if (h.shakeY.length >= 4 && t - (h.dumpAt || 0) > 700) {   // turned upside down and shaken: one thing at a time falls out
+        h.dumpAt = t; h.shakeY = [];
+        const last = h.meals[h.meals.length - 1];
+        if (last) { onInput({ type: 'release-one', id: h.id, key: last.key }); petEvent(h, { text: 'Something fell out.', achieve: 'shakedown' }); }
+        else if (t - (h.emptyAt || 0) > 4000) { h.emptyAt = t; petEvent(h, { text: 'Nothing in there.' }); }
+      }
+    }
+    h.nausea = Math.max(0, (h.nausea || 0) - dt / 7);
+    // Music on the PC: it dances (sways side to side on the beat, the disk pulsing), unless parked or you're typing.
+    h.dance += (music.on * (1 - h.park) * (1 - 0.6 * focus) * (h.fear === 'loud music' ? 0 : 1) - h.dance) * Math.min(1, dt * 2);
+    if (music.beat && h.dance > 0.05) { h.swayDir = -h.swayDir; h.beat = 1; }
+    h.beat *= Math.exp(-dt * 6);
+    h.sway += (h.swayDir * h.dance * (h.hobby === 'music' ? 1.6 : 1) - h.sway) * Math.min(1, dt * 7);
+    if (h.dance > 0.5) { h.stats.danceS += dt; if (h.stats.danceS > 300) achieveOnce(h, 'dance'); }
+    h.park += ((h.parked ? 1 : 0) - h.park) * Math.min(1, dt * 1.5);
+    // How much it has eaten lately (fades over a minute and a half): drives how bright it burns (see moodOf).
+    h.accr = (h.accr || 0) * Math.exp(-dt / 90);
+    h.wind = Math.max(0, (h.wind || 0) - dt / 6);
+    // Unfed for days, and you've switched it on: Hawking radiation (sped up a few trillion trillion times) shrinks it.
+    if (settings.evaporate && t - (h.lastFed || t) > 3 * 86400e3) h.massTarget = Math.max(0.3, h.massTarget * Math.pow(0.98, dt / 86400));
+    // Ignored for two days: it sulks (turns away from you, dims) until you feed it something.
+    if (!h.sulking && t - (h.lastTouch || t) > 2 * 86400e3) h.sulking = true;
+    // Yawning: now and then while drowsy, the disk stretches out and settles.
+    if (h.sleep > 0.3 && h.sleep < 0.95 && t - (h.yawnAt || 0) > 40000 + (h.id * 7919 % 30000)) h.yawnAt = t;
+    { const p = (t - (h.yawnAt || 0)) / 2400; h.yawn = p >= 0 && p < 1 ? Math.sin(Math.PI * p) : 0; }
+    // Hiccups after a big meal: every few seconds a little hic, a jolt and a puff of mass.
+    if (t < (h.hicUntil || 0) && t - (h.hicAt || 0) > 2600 + 1600 * Math.random()) {
+      h.hicAt = t; h.tvx += 1.4 * (Math.random() < 0.5 ? -1 : 1); h.tvy -= 1.0;
+      h.massTarget = Math.max(0.3, h.massTarget - 0.002);
+      events.push({ type: 'hic', mass: h.mass, x: h.x });
+    }
+    // Fears: it trembles and keeps away from what scares it (a dark desktop just makes it glow, like a nightlight).
+    const big = h.fear === 'bigger black holes' && holes.find(o => o !== h && !o.deathAt && o.mass > h.mass * 1.8 && Math.hypot(o.x - h.x, o.y - h.y) < 5 * (shadowR(o) + shadowR(h)));
+    const afraid = !h.deathAt && drag?.id !== h.id && (big || (h.fear === 'bright windows' && h.light > 0.82) || (h.fear === 'the dark' && h.light < 0.08) || (h.fear === 'loud music' && music.on > 0.5));
+    if (afraid && (h.scared || 0) < 0.1) h.fleeAng = big ? Math.atan2(h.y - big.y, h.x - big.x) : Math.random() * 6.283;
+    h.scared = (h.scared || 0) + ((afraid ? 1 : 0) - (h.scared || 0)) * Math.min(1, dt * (afraid ? 2 : 0.3));
+    h.fleeFrom = big || null;
+    // Hobbies: picked up from how it spends its time.
+    if (!h.hobby && t - (h.hobbyCheck || 0) > 10000) {
+      h.hobbyCheck = t;
+      const coll = Object.entries(h.tastes || {}).find(([, n]) => n >= 12)?.[0];
+      const hb = h.stats.danceS > 600 ? 'music' : h.stats.petS > 600 ? 'cuddles' : coll ? `collecting ${coll}` : t - h.born > 2 * 86400e3 && Math.random() < 0.02 ? 'stargazing' : null;
+      if (hb) { h.hobby = hb; petEvent(h, { text: `${h.name} has taken up ${HOBBY_TEXT[hb] || hb}.`, achieve: 'hobby' }); }
+    }
+    // Jealousy: you're petting another one, and it hasn't had any attention for a while.
+    const othersPetted = holes.some(o => o !== h && !o.deathAt && (o.purr || 0) > 0.5);
+    if (h.purr > 0.5) h.lastPet = t;
+    const envious = othersPetted && t - (h.lastPet || 0) > 120000 && (h.sleep || 0) < 0.5 && !h.deathAt;
+    const wasJ = h.jealous || 0;
+    h.jealous = Math.max(0, Math.min(1, wasJ + (envious ? dt / 6 : -dt / 10)));
+    if (wasJ < 0.6 && h.jealous >= 0.6) petEvent(h, { text: `${h.name} is jealous.`, sub: 'It wants some attention too.', achieve: 'jealous' });
+    h.groom = Math.max(0, (h.groom || 0) - dt / 8);
+    // Space Oddity playing: it lifts off and floats gently up toward the top of the screen.
+    const fl = song === 'space oddity' && !h.deathAt;
+    if (fl && !h.floating) petEvent(h, { text: 'Lift-off.', sub: 'It\'s drifting up toward the stars.', achieve: 'majortom' });
+    h.floating = fl;
+    // Dreaming: fast asleep, every couple of minutes it dreams of the biggest thing it ever ate, a ghost in its disk.
+    const dreaming = h.sleep > 0.6 && ((t / 1000 + h.id * 37) % 120) < 25;
+    h.dream = (h.dream || 0) + ((dreaming ? 1 : 0) - (h.dream || 0)) * Math.min(1, dt * 0.4);
+    // Playing: bored and sitting by a small window, it bats it a few pixels and back now and then (Settings can stop it).
+    if (bored && h.boredTarget && h.boredKey && settings.playWithWindows !== false && focus < 0.3 && t - (h.playAt || 0) > 9000) {
+      const [l, tp, r, b] = h.boredTarget, cx = (l + r) / 2, cy = (tp + b) / 2, d = Math.hypot(cx - h.x, cy - h.y) || 1;
+      if (d < Math.hypot(r - l, b - tp) / 2 + shadowR(h) * 2.5) {
+        h.playAt = t;
+        const nx = Math.round((cx - h.x) / d * 14), ny = Math.round((cy - h.y) / d * 14);
+        api.send('nudge', h.boredKey, nx, ny);
+        setTimeout(() => api.send('nudge', h.boredKey, -nx, -ny), 450);
+        h.excite = Math.max(h.excite || 0, 0.3);
+      }
+    }
+    // Growing up.
+    if (h.baby) {
+      h.massTarget = Math.min(h.massTarget + dt * 0.4 / 3600, 4);
+      if (h.massTarget >= 0.7 || t - h.born > 2 * 3600e3) { h.baby = false; petEvent(h, { achieve: 'grown', text: `${h.name} is all grown up.` }); }
+    }
+    if (h.spin >= 0.99) achieveOnce(h, 'spin');
+    if (h.massTarget >= 3.99) achieveOnce(h, 'heavy');
+    if (t - h.born > 7 * 86400e3) achieveOnce(h, 'week');
+    for (const a of ['x', 'y']) {
+      const tremble = (h.scared || 0) * 0.025 * Math.sin(t / 1000 * (a === 'x' ? 31 : 27));
+      const lean = clamp(h['v' + a] * 0.00035 + (a === 'x' ? leanX : leanY) + tremble + (h.floating && a === 'y' ? -0.06 : 0), 0.3);
+      h['tv' + a] += (TILT_K * (lean - h['tilt' + a]) - TILT_DAMP * h['tv' + a]) * dt;
+      h['tilt' + a] += h['tv' + a] * dt;
+    }
+    h.ghost += ((h.ghostOn ? 1 : 0) - h.ghost) * Math.min(1, dt * 10);
+    // Held still over a window, it gets hungry (and you can see it): moving on restarts the count.
+    if (drag?.id === h.id && drag.cand && Math.hypot(h.vx, h.vy) > 250) drag.cand.since = t;
+    h.hunger += ((drag?.id === h.id && drag.cand && t - drag.cand.since > EAT_HOLD ? 1 : 0) - h.hunger) * Math.min(1, dt * 6);
+    if (h.retro > 0) h.retro = Math.max(h.retro - dt, 0);
+    // Hunger creeps up over about eight hours; excitement fades over twenty seconds; late at night, left alone for
+    // ten minutes, it slowly dozes off (and wakes the moment you touch it).
+    h.appetite = Math.min(1, (h.appetite ?? 0.3) + dt / (8 * 3600) * (h.trait === 'greedy' ? 1.6 : 1));
+    h.excite = Math.max(0, (h.excite || 0) - dt / 20 * (h.trait === 'lazy' ? 2 : 1));
+    const hour = new Date().getHours();
+    const sleepy = ((hour >= 23 || hour < 7) && t - (h.touched || t) > 10 * 60 * 1000)
+                || (h.trait === 'lazy' && t - (h.touched || t) > 20 * 60 * 1000 && h.dance < 0.3);
+    h.sleep = sleepy ? Math.min(1, (h.sleep || 0) + dt / 60) : Math.max(0, (h.sleep || 0) - dt * 2);
+    const mood0 = h.mood;
+    h.mood = moodOf(h).label;
+    // A quiet sound for some moods: when it starts feeling that way, and now and then while it does.
+    if (MOOD_SOUNDS.includes(h.mood) && (h.mood !== mood0 || t - (h.moodSoundAt || 0) > 35000) && t - (h.moodSoundAt || 0) > 4000) {
+      h.moodSoundAt = t; events.push({ type: 'mood', mood: h.mood, mass: h.mass });
+    }
+    // Lined up with another hole, side by side or one above the other: a slow ring of light from its photon sphere.
+    const lined = !h.deathAt && holes.some(o => {
+      if (o === h || o.deathAt) return false;
+      const dx = o.x - h.x, dy = o.y - h.y, d = Math.hypot(dx, dy);
+      return d < 10 * (shadowR(o) + shadowR(h)) && Math.min(Math.abs(dx), Math.abs(dy)) / d < 0.06;
+    });
+    h.align = (h.align || 0) + ((lined ? 1 : 0) - (h.align || 0)) * Math.min(1, dt * (lined ? 0.6 : 1.5));
+    if (lined && h.align > 0.8) achieveOnce(h, 'syzygy');
+    h.pulse += ((sound.level(h.id) || 0) - h.pulse) * Math.min(1, dt * 18);
+    // Left alone long enough, a hole gets bored and wanders off toward the nearest window, slowly, and waits there.
+    // (bored: worked out above)
+    h.bored += ((bored ? 1 : 0) - h.bored) * Math.min(1, dt * 0.5);
+    // Very hungry and left alone a few minutes, it goes and waits by a window too: a hint, never a meal on its own.
+    const roam = bored || (!h.deathAt && !h.pinned && drag?.id !== h.id && !inBinary.has(h.id) && (h.appetite ?? 0) > 0.8 && t - (h.touched || t) > 5 * 60 * 1000);
+    if (roam && t - h.boredAt > 15000) { h.boredAt = t; api.send('nearest', h.id, h.x, h.y); }
+    const w = wantWalk(h, t, roam, inBinary);
+    h.walk = !!w;
+    if (w) { h.vx += (w[0] - h.vx) * Math.min(1, dt * 3); h.vy += (w[1] - h.vy) * Math.min(1, dt * 3); h.tx = h.x; h.ty = h.y; }
+    if (h.feed >= 0 && (h.feed += dt) > 3.8) h.feed = -1;
+    if (h.wave >= 0 && (h.wave += dt) > 2.5) h.wave = -1;
+    if (h.tde >= 0 && (h.tde += dt) > TDE_TIME) h.tde = -1;
+  }
+
+  // Two free holes that come close enough lock into a binary.
+  for (let i = 0; i < holes.length; i++) for (let j = i + 1; j < holes.length; j++) {
+    const a = holes[i], b = holes[j];
+    if (a.deathAt || b.deathAt || inBinary.has(a.id) || inBinary.has(b.id) || drag?.id === a.id || drag?.id === b.id || !pulls(a, b, t)) continue;
+    const dx = a.x - b.x, dy = a.y - b.y, dist = Math.hypot(dx, dy);
+    if (dist > 0.33 * LENS * (rsPx(a) + rsPx(b)) || dist < 2.6 * (rsPx(a) + rsPx(b)) * 0.6) continue;
+    const M = a.mass + b.mass;
+    const L = dx * (a.vy - b.vy) - dy * (a.vx - b.vx);   // which way they were already going round
+    binaries.push({ a: a.id, b: b.id, com: { x: (a.x * a.mass + b.x * b.mass) / M, y: (a.y * a.mass + b.y * b.mass) / M },
+                    vcom: { x: (a.vx * a.mass + b.vx * b.mass) / M, y: (a.vy * a.mass + b.vy * b.mass) / M },
+                    a0: dist, sep: dist, phi: Math.atan2(dy, dx), dir: L < 0 ? -1 : 1, w0: 2 * Math.PI * 0.45, t: 0, f: 0.9 });
+    inBinary.add(a.id); inBinary.add(b.id);
+  }
+
+  // Two holes whose shadows overlap merge into one. About 5% of the mass leaves as gravitational waves (roughly
+  // what LIGO measures), the result rings down, and the asymmetric burst of waves kicks it: a recoil.
+  for (let i = 0; i < holes.length; i++) for (let j = i + 1; j < holes.length; j++) {
+    const a = holes[i], b = holes[j];
+    if (a.deathAt || b.deathAt) continue;
+    const dist = Math.hypot(a.x - b.x, a.y - b.y);
+    if (dist > 2.6 * (rsPx(a) + rsPx(b)) * 0.6) continue;
+    const keep = drag?.id === b.id || (drag?.id !== a.id && b.mass > a.mass) ? b : a, gone = keep === a ? b : a;
+    const m = a.mass + b.mass, q = Math.min(a.mass, b.mass) / Math.max(a.mass, b.mass);
+    keep.x = (a.x * a.mass + b.x * b.mass) / m; keep.y = (a.y * a.mass + b.y * b.mass) / m;
+    keep.vx = (a.vx * a.mass + b.vx * b.mass) / m; keep.vy = (a.vy * a.mass + b.vy * b.mass) / m;
+    // Recoil: strongest for unequal masses (zero for a perfectly symmetric merger), plus a spin-driven part.
+    const kick = 900 * q * q * (1 - q) / (1 + q) ** 5 * 16 + 250 * (lookOf(keep).spin) * Math.random();
+    const dir = Math.random() * Math.PI * 2;
+    keep.vx += Math.cos(dir) * kick; keep.vy += Math.sin(dir) * kick;
+    keep.tx = keep.x; keep.ty = keep.y;
+    // The merged hole's spin (aligned spins; Barausse & Rezzolla 2009 fit to simulations): the orbit's angular momentum
+    // gives about 0.69 for equal masses with no spin, and the old spins add on top. (Before keep.mass changes.)
+    const eta = a.mass * b.mass / (m * m);   // q (mass ratio <= 1) is from above
+    const [a1, a2] = a.mass >= b.mass ? [a.spin || 0, b.spin || 0] : [b.spin || 0, a.spin || 0];
+    const at = (a1 + a2 * q * q) / (1 + q * q);
+    keep.spin = Math.min(0.998, Math.max(0, at + at * eta * (-0.1229 * at + 0.4537 * eta - 2.8904) + eta * (2 * Math.sqrt(3) - 3.5171 * eta + 2.5763 * eta * eta)));
+    keep.mass = 0.95 * m;
+    keep.massTarget = Math.min(0.95 * (a.massTarget + b.massTarget), 4);
+    keep.name = (a.born <= b.born ? a : b).name;   // the older one keeps its name
+    keep.lineage = { n: keep.name, b: Math.min(a.born, b.born), p: [trimTree(a.lineage), trimTree(b.lineage)].filter(Boolean) };
+    keep.children = [...(a.children || []), ...(b.children || [])].slice(-12);
+    for (const tr of gone.trophies || []) addTrophy(keep, tr);
+    for (const k of ['eaten', 'petS', 'danceS']) keep.stats[k] = (a.stats?.[k] || 0) + (b.stats?.[k] || 0);
+    keep.bonds = { ...gone.bonds, ...keep.bonds }; keep.trust = Math.max(a.trust || 0, b.trust || 0); keep.baby = false;
+    if (keep.baby === false && keep.parentUid === gone.uid) keep.parentUid = null;
+    petEvent(keep, { achieve: 'merger' });
+    keep.born = Math.min(a.born, b.born);
+    keep.appetite = Math.min(a.appetite ?? 0.3, b.appetite ?? 0.3);
+    keep.excite = 1;
+    keep.wave = 0;
+    keep.tvx += 2.5; keep.tvy -= 2.0;
+    keep.meals = [...keep.meals, ...gone.meals];
+    holes.splice(holes.indexOf(gone), 1);
+    if (drag?.id === gone.id || drag?.id === keep.id) drag = null;   // the recoil takes it out of your hand
+    events.push({ type: 'merge', mass: keep.mass, inspiral: binaries.some(B => [B.a, B.b].includes(keep.id) && [B.a, B.b].includes(gone.id)) });
+  }
+
+  // Journal: once a minute, how long each hole purred, danced and slept (main.js keeps the diary).
+journalAt ||= t;
+if (t - journalAt > 60000) {
+  journalAt = t;
+  api.send('journal', holes.filter(o => !o.deathAt && o.uid).map(o => {
+    const j = (o.jr ||= { petS: o.stats.petS, danceS: o.stats.danceS, sleepS: 0 });
+    const out = { uid: o.uid, petS: Math.round(o.stats.petS - j.petS), danceS: Math.round(o.stats.danceS - j.danceS), sleepS: Math.round(o.sleptS || 0) };
+    j.petS = o.stats.petS; j.danceS = o.stats.danceS; o.sleptS = 0;
+    return out;
+  }));
+}
+for (const o of holes) if ((o.sleep || 0) > 0.6) o.sleptS = (o.sleptS || 0) + dt;
+
+// Stealing: a hole that comes close to another while something is still falling into it takes it for itself.
+  for (const [key, f] of falling) {
+    const a = holes.find(x => x.id === f.owner);
+    if (!a || t - f.start > MEAL_TIME * 700) continue;
+    for (const b of holes) {
+      if (b === a || b.deathAt || b.baby || b.mass < a.mass * 0.25) continue;
+      if (Math.hypot(a.x - b.x, a.y - b.y) > 1.6 * (shadowR(a) + shadowR(b))) continue;
+      const meal = a.meals.find(x => x.key === key);
+      if (!meal) break;
+      a.meals = a.meals.filter(x => x !== meal); b.meals.push(meal);
+      f.owner = b.id; f.start = t;
+      api.send('steal', key, b.id);
+      // Keep stealing from each other and they become rivals: they keep apart and never make friends.
+      const n = (a.rivals[b.uid] || 0) + 1;
+      a.rivals[b.uid] = b.rivals[a.uid] = n;
+      if (n === 3) { a.bonds[b.uid] = b.bonds[a.uid] = 0; setTimeout(() => petEvent(a, { text: `${a.name} and ${b.name} are rivals now.`, sub: 'Too much stealing.', achieve: 'rivals' }), 3000); }
+      petEvent(b, { text: `${b.name} stole it!`, sub: `Right out from under ${a.name}.`, achieve: 'thief' });
+      break;
+    }
+  }
+
+  // Grooming: two friends sitting together now and then tidy each other's disks.
+  for (let i = 0; i < holes.length; i++) for (let j = i + 1; j < holes.length; j++) {
+    const a = holes[i], b = holes[j];
+    if (a.deathAt || b.deathAt || (a.bonds[b.uid] || 0) < 1 || Math.hypot(a.x - b.x, a.y - b.y) > 2.6 * (shadowR(a) + shadowR(b))) continue;
+    if (Math.hypot(a.vx, a.vy) > 40 || Math.hypot(b.vx, b.vy) > 40 || t - Math.max(a.groomAt || 0, b.groomAt || 0) < 150000) continue;
+    const [groomer, groomed] = Math.random() < 0.5 ? [a, b] : [b, a];
+    groomer.groomAt = groomed.groomAt = t;
+    groomed.groom = 1; groomed.excite = Math.max(groomed.excite || 0, 0.4);
+    const d = Math.hypot(groomed.x - groomer.x, groomed.y - groomer.y) || 1;
+    groomer.tvx += (groomed.x - groomer.x) / d * 1.2; groomer.tvy += (groomed.y - groomer.y) / d * 1.2;
+    if (Math.random() < 0.4) petEvent(groomer, { text: `${groomer.name} is grooming ${groomed.name}.`, achieve: 'grooming' });
+  }
+
+  // Holes that spend time near each other become friends (about ten minutes); two with the same name, instantly.
+  for (let i = 0; i < holes.length; i++) for (let j = i + 1; j < holes.length; j++) {
+    const a = holes[i], b = holes[j];
+    if (a.deathAt || b.deathAt) continue;
+    const was = a.bonds[b.uid] || 0;
+    let now = was;
+    if (a.name === b.name) now = Math.max(was, 1);
+    else if ((a.rivals[b.uid] || 0) >= 3) now = 0;   // rivals don't make friends
+    else if (Math.hypot(a.x - b.x, a.y - b.y) < 6 * (shadowR(a) + shadowR(b))) now = Math.min(1.2, was + dt / 600);
+    if (now === was) continue;
+    a.bonds[b.uid] = b.bonds[a.uid] = now;
+    if (now >= 1 && was < 1) petEvent(a, { achieve: 'friends', text: `${a.name} and ${b.name} are friends now.`, sub: a.name === b.name ? 'Same name. Instant friends.' : '' });
+  }
+
+  // Finished evaporating: gone.
+  holes = holes.filter(h => !h.deathAt || (t - h.deathAt) / 1000 < EVAPORATE + BURST);
+}
+
+function onInput(m) {
+  const h = holes.find(h => h.id === m.id);
+  // Anything you do to a hole means it isn't bored any more.
+  if (h && ['down', 'wheel', 'feed', 'tde', 'ghost', 'release', 'retro', 'music'].includes(m.type)) { h.touched = clock(); h.lastTouch = clock(); h.boredTarget = null; }
+  if (m.type === 'move' && drag) { const d = holes.find(x => x.id === drag.id); if (d) { d.touched = clock(); d.boredTarget = null; } }
+  switch (m.type) {
+    case 'down':
+      if (!h || h.deathAt) return;
+      h.handled = clock(); h.parkTo = h.parkFrom = null;   // where you put it now is its choice
+      drag = { id: h.id, off: { x: h.x - m.cursor.x, y: h.y - m.cursor.y }, last: m.cursor, cand: null, probeAt: 0 };
+      h.tx = h.x; h.ty = h.y;
+      return;
+    case 'move': {
+      const d = drag && holes.find(h => h.id === drag.id);
+      if (!d) return;
+      if (m.shift) {   // fine positioning: the hole follows a quarter of the mouse movement
+        d.tx += (m.cursor.x - drag.last.x) * 0.25; d.ty += (m.cursor.y - drag.last.y) * 0.25;
+        drag.off = { x: d.tx - m.cursor.x, y: d.ty - m.cursor.y };   // no jump when Shift is released
+      } else { d.tx = m.cursor.x + drag.off.x; d.ty = m.cursor.y + drag.off.y; }
+      drag.last = m.cursor;
+      return;
+    }
+    case 'up': {   // let go: it keeps whatever speed it had (throwing); dropped on a window long enough, it eats it
+      const d = drag && holes.find(h => h.id === drag.id), c = drag?.cand;
+      if (d) d.handled = clock();
+      if (d && Math.hypot(d.vx, d.vy) > 1500) d.excite = Math.max(d.excite || 0, d.trait === 'playful' ? 0.9 : 0.6);   // thrown: whee
+      if (d && c && clock() - c.since > EAT_HOLD && !d.meals.some(m => m.key === c.key)) {
+        const [l, t, r, b] = c.rect;
+        if (d.x >= l && d.x < r && d.y >= t && d.y < b) api.send('eat', d.id, c.key, c.rect, c.title);
+      }
+      drag = null;
+      return;
+    }
+    case 'wheel':
+      if (h) h.massTarget = Math.min(Math.max(h.massTarget * Math.exp(-m.dy * 0.0012), 0.3), 4);
+      return;
+    case 'feed':   // a clump of gas: a snack
+      if (h && h.feed < 0 && !h.deathAt) { h.feed = 0; events.push({ type: 'gulp', mass: h.mass }); fed(h, 0.01, 0.08, 0.4); }
+      return;
+    case 'tde':    // a whole star: a feast
+      if (h && h.tde < 0 && !h.deathAt) { h.tde = 0; events.push({ type: 'tde', mass: h.mass }); setTimeout(() => { fed(h, 0.05, 0.35, 1, 'rich'); maybeBaby(h, 0.3); h.hicUntil = clock() + 25000; }, 2500); achieveOnce(h, 'tde'); }
+      return;
+    case 'rename': if (h && typeof m.name === 'string' && m.name.trim()) { h.name = m.name.trim().slice(0, 40); if (h.lineage) h.lineage.n = h.name; } return;
+    case 'cursor': {
+      const now = clock(), p = m.p;
+      if (cursorPt) {
+        const s = Math.max((now - cursorPt.t) / 1000, 0.01), vx = (p.x - cursorPt.x) / s, vy = (p.y - cursorPt.y) / s;
+        cursorVX = cursorVX * 0.4 + vx * 0.6; cursorVY = cursorVY * 0.4 + vy * 0.6; cursorV = Math.hypot(cursorVX, cursorVY);
+        if (Math.hypot(p.x - cursorPt.x, p.y - cursorPt.y) > 3) cursorMovedAt = now;
+      }
+      cursorPt = { x: p.x, y: p.y, t: now };
+      return;
+    }
+    case 'typing': typingRate = typingRate * 0.5 + m.n * 0.5; if (m.n > 0) lastTypingAt = clock(); return;
+    case 'fullscreen': fullscreenRect = Array.isArray(m.rect) ? m.rect : null; park(); return;
+    case 'pin': if (h) { h.pinned = !!m.on; h.parkTo = null; } return;
+    case 'path': if (h && Array.isArray(m.pts) && m.pts.length) { h.path = { pts: m.pts, i: 0, eats: m.eats || [] }; h.touched = h.lastTouch = clock(); h.boredTarget = null; } return;
+    case 'light': if (h && Number.isFinite(m.v)) h.light = m.v; return;
+    case 'song': song = m.id || ''; return;
+    case 'hello': {   // typed "hello" with the cursor near a hole: it waves back
+      const near = holes.filter(o => !o.deathAt && Math.hypot(o.x - m.x, o.y - m.y) < shadowR(o) * 8).sort((a, b) => Math.hypot(a.x - m.x, a.y - m.y) - Math.hypot(b.x - m.x, b.y - m.y))[0];
+      if (near) { near.helloAt = clock(); near.excite = Math.max(near.excite || 0, 0.5); events.push({ type: 'mood', mood: 'excited', mass: near.mass }); petEvent(near, { text: 'Hello.', achieve: 'hello' }); }
+      return;
+    }
+    case 'refuse': if (h) { h.tvx += 3; h.tvy -= 1; h.excite = 0; } return;   // "...no." (a little shake of the head)
+    case 'trophy': if (h && m.trophy) addTrophy(h, m.trophy); return;
+    case 'replace-pets': {   // imported from a backup: these pets, instead of the ones here
+      for (const o of holes) release(o);
+      const d = allowedDisplays().find(d => d.primary) || allowedDisplays()[0];
+      holes = (m.pets || []).slice(0, MAXH).map((p, i) => newHole(d.phys.x + d.phys.width * (0.3 + 0.13 * i), d.phys.y + d.phys.height / 2, p.mass || 1, p.overrides || {}, { ...p, uid: undefined }));
+      hadHoles = holes.length > 0; drag = null; binaries = [];
+      return;
+    }
+    case 'spit-one': if (h) onInput({ type: 'release-one', id: h.id, key: m.key }); return;
+    case 'adopt-pet': {   // from a share code (main.js checked and cleaned it)
+      if (holes.filter(x => !x.deathAt).length >= MAXH || !m.pet) return;
+      const d = allowedDisplays().find(d => d.primary) || allowedDisplays()[0], p = m.pet;
+      const nh = newHole(d.phys.x + d.phys.width * 0.35, d.phys.y + d.phys.height / 2, p.mass || 1, p.overrides || {}, { ...p, uid: undefined, pinned: false });
+      if (p.parentUid && holes.some(o => o.uid === p.parentUid)) { nh.parentUid = p.parentUid; nh.baby = true; }
+      holes.push(nh);
+      hadHoles = true;
+      announceRare(nh);
+      return;
+    }
+    case 'ghost': if (h) h.ghostOn = m.on; return;
+    case 'die':
+      if (h && !h.deathAt) { h.deathAt = clock(); release(h); events.push({ type: 'evaporate', mass: h.mass }); }
+      if (drag?.id === m.id) drag = null;
+      return;
+    case 'die-all':
+      for (const h of holes) if (!h.deathAt) { h.deathAt = clock(); release(h); }
+      events.push({ type: 'evaporate', mass: 1 });
+      drag = null;
+      return;
+    case 'add': {
+      if (holes.length >= MAXH) return;
+      const dc = displayAt(m.cursor.x, m.cursor.y), d = dc && allowedDisplays().includes(dc) ? dc : allowedDisplays().find(d => d.primary) || allowedDisplays()[0];
+      let x = d.phys.x + d.phys.width / 2, y = d.phys.y + d.phys.height / 2;
+      if (holes.some(o => Math.hypot(o.x - x, o.y - y) < 500)) x += d.phys.width * 0.3;
+      const nh = newHole(x, y);
+      holes.push(nh);
+      hadHoles = true;
+      announceRare(nh);
+      return;
+    }
+    case 'meal': {   // main hid it; the pages are animating its image falling in
+      if (!h) return;
+      // Pecking order: a much heavier hole close by gets first pick.
+      const boss = !m.peck && holes.find(o => o !== h && !o.deathAt && !o.baby && (o.sleep || 0) < 0.5 && o.mass > h.mass * 1.3
+                                          && Math.hypot(o.x - h.x, o.y - h.y) < 3.5 * (shadowR(o) + shadowR(h)) && (o.rivals[h.uid] || 0) < 3);
+      if (boss) {
+        api.send('steal', m.key, boss.id, true);
+        petEvent(boss, { text: `${boss.name} gets first pick.`, sub: 'The heaviest eats first.' });
+        onInput({ ...m, id: boss.id, peck: true });
+        return;
+      }
+      // It brings its own mass: in proportion to its area, where a whole 1920x1080 screen's worth is one hole mass.
+      const mass = m.mass ?? m.area / (1920 * 1080), q = QUALITY[m.quality] ? m.quality : 'plain';
+      falling.set(m.key, { owner: h.id, start: clock() });
+      events.push({ type: 'gulp', mass: h.mass, big: mass > 0.02, fall: true, x: h.x });
+      // Mood: queasy, it won't eat anything; stuffed full, it turns its nose up at snacks.
+      const refuse = (h.nausea || 0) > 0.3 ? ['Not now.', 'It still feels a bit sick.'] : (h.appetite ?? 0.3) < 0.08 && (q === 'snack' || q === 'unsatisfying') ? ['Too full.', 'It\'s had plenty. Try again when it\'s hungrier.'] : null;
+      if (refuse) {
+        h.meals.push({ key: m.key, mass: 0, quality: q });
+        petEvent(h, { text: refuse[0], sub: refuse[1] });
+        setTimeout(() => { const f = falling.get(m.key); falling.delete(m.key); onInput({ type: 'release-one', id: f?.owner ?? m.id, key: m.key }); }, MEAL_TIME * 1000 + 300);
+        return;
+      }
+      // Favourite food tastes better (a step up in quality), and it's pleased about it.
+      const cat = typeof m.cat === 'string' ? m.cat.slice(0, 20) : '';
+      const fav = cat && favouriteOf(h) === cat;
+      const qq = fav ? UPGRADE[q] : q;
+      if (fav && Math.random() < 0.5) setTimeout(() => petEvent(h, { text: 'Its favourite!', sub: `It loves ${cat}.` }), MEAL_TIME * 700);
+      // Eddington limit: fed too much too fast, the light from all that infalling gas pushes the rest back out.
+      if ((h.accr || 0) > EDD * h.mass) {
+        h.meals.push({ key: m.key, mass: 0, quality: q });
+        h.wind = 1;
+        petEvent(h, { text: 'Too much at once.', sub: 'Over the Eddington limit: its own light pushes the rest back out.', achieve: 'eddington' });
+        setTimeout(() => { const f = falling.get(m.key); falling.delete(m.key); onInput({ type: 'release-one', id: f?.owner ?? m.id, key: m.key }); }, MEAL_TIME * 1000 + 300);
+        return;
+      }
+      h.meals.push({ key: m.key, mass, quality: qq });
+      if (cat) h.tastes[cat] = (h.tastes[cat] || 0) + 1;
+      if (!fav && QUALITY[qq].word && Math.random() < 0.35) setTimeout(() => petEvent(h, { text: QUALITY[qq].word }), MEAL_TIME * 900);
+      const finish = () => {
+        const f = falling.get(m.key);
+        if (f && clock() - f.start < MEAL_TIME * 800 - 30) { setTimeout(finish, MEAL_TIME * 800 - (clock() - f.start)); return; }   // stolen: restarted
+        falling.delete(m.key);
+        const g = holes.find(x => x.id === (f?.owner ?? m.id));
+        if (!g || !g.meals.some(x => x.key === m.key)) return;
+        g.feed = 0; g.massTarget = Math.min(g.massTarget + mass, 4);
+        events.push({ type: 'taste', quality: qq, mass: g.mass });
+        fed(g, mass, Math.min(mass * 3, 0.6), fav ? 1 : 0.7, qq); g.stats.eaten++; maybeBaby(g, mass);
+        if (mass >= 0.12) g.hicUntil = clock() + 25000;   // a big one gives it hiccups
+      };
+      setTimeout(finish, MEAL_TIME * 800);
+      return;
+    }
+    case 'meal-failed': return;
+    case 'release': if (h) release(h); return;
+    case 'release-one': {   // give back one thing (the Recycle Bin always comes back)
+      const meal = h?.meals.find(x => x.key === m.key);
+      if (!meal) return;
+      h.meals = h.meals.filter(x => x !== meal);
+      h.massTarget = Math.max(h.massTarget - meal.mass, 0.3);
+      api.send('release', h.id, [m.key]);
+      sound.stopMusic(m.key);
+      return;
+    }
+    case 'retro': if (h && !h.deathAt) { h.retro = 30; events.push({ type: 'retro' }); } return;
+    case 'music': if (h && !h.deathAt) sound.music(h.id, m.key, m.url); return;
+    case 'released-all': for (const h of holes) { h.massTarget = Math.max(h.massTarget - h.meals.reduce((s, m) => s + m.mass, 0), 0.3); h.meals = []; } return;
+    case 'hole-settings':
+      if (h) {
+        h.overrides = m.patch ? { ...h.overrides, ...m.patch } : {};
+        if (m.patch && 'bhSpin' in m.patch) h.spin = +m.patch.bhSpin;   // setting its spin by hand
+      }
+      return;
+  }
+}
+// Eating: less hungry, a little spun up, and pleased about it.
+function fed(h, dm, satisfies, excite, quality = 'plain') {
+  const Q = QUALITY[quality] || QUALITY.plain;
+  spinUp(h, dm);
+  h.accr = (h.accr || 0) + dm;
+  h.appetite = Math.max(0, (h.appetite ?? 0.3) - satisfies * Q.fill * (h.trait === 'greedy' ? 0.7 : 1));
+  h.excite = Math.max(h.excite || 0, excite * Q.joy * (h.trait === 'greedy' ? 1.3 : 1));
+  h.touched = h.lastTouch = h.lastFed = clock(); h.sleep = 0;
+  if (h.sulking) { h.sulking = false; h.excite = 1; petEvent(h, { text: `${h.name} forgives you.`, sub: 'A snack fixes most things.' }); }
+}
+function release(h) {
+  for (const m of h.meals) sound.stopMusic(m.key);
+  if (!h.meals.length) return;
+  api.send('release', h.id, h.meals.map(m => m.key));
+  // Spitting things out gives back exactly the mass they brought.
+  h.massTarget = Math.max(h.massTarget - h.meals.reduce((s, m) => s + m.mass, 0), 0.3);
+  h.meals = [];
+}
+// While dragging, ask what window is under the hole (a few times a second).
+function probeWhileDragging(t) {
+  if (!drag || t - drag.probeAt < 200) return;
+  const d = holes.find(h => h.id === drag.id);
+  if (!d) return;
+  drag.probeAt = t;
+  api.send('probe', d.id, d.x, d.y);
+}
+api.on('nearest-result', (id, r) => {
+  const h = holes.find(h => h.id === id);
+  if (h && r.key) { h.boredTarget = r.rect; h.boredKey = r.key; }
+});
+// Born rare: say so.
+const announceRare = h => { if (h.rare) setTimeout(() => petEvent(h, { text: 'A rare one!', sub: RARE_TEXT[h.rare], achieve: 'rare' }), 1200); };
+api.on('probe-result', (id, r) => {
+  if (!drag || drag.id !== id) return;
+  if (!r.key) { drag.cand = null; return; }
+  if (drag.cand?.key !== r.key) drag.cand = { key: r.key, rect: r.rect, title: r.title, since: clock() };
+  else drag.cand.rect = r.rect;
+});
+
+// =====================================================================================================
+//  Every window: input
+// =====================================================================================================
+let over = -1, myDrag = false, altOn = -1;
+function holeAt(clientX, clientY) {
+  const t = clock();
+  for (const v of views(t)) {
+    if (v.h.deathAt) continue;
+    const S = v.rs * 28;   // the old view scale: px per unit of view angle
+    const u = (origin.x + clientX * dpr - v.x) / S, w = (origin.y + clientY * dpr - v.y) / S;
+    if ((u / 0.42) ** 2 + (w / 0.16) ** 2 < 1 || u*u + w*w < 0.12 ** 2) return v.h.id;   // inner disk, or the hole
+  }
+  return -1;
+}
+function setOver(id) {
+  if (id === over) return;
+  if ((id >= 0) !== (over >= 0)) api.send('hit', id >= 0);
+  over = id;
+  document.body.classList.toggle('grab', id >= 0);
+}
+function setAlt(id) {   // hold Alt over a hole to see through it
+  if (id === altOn) return;
+  if (altOn >= 0) api.send('input', { type: 'ghost', id: altOn, on: false });
+  if (id >= 0) api.send('input', { type: 'ghost', id, on: true });
+  altOn = id;
+}
+addEventListener('mousemove', e => {
+  if (isShare) return;
+  // While the button is down this window keeps getting the mouse even past its monitor, so drags cross monitors.
+  if (drawing) {
+    const p = [origin.x + e.clientX * dpr, origin.y + e.clientY * dpr], q = drawing.pts[drawing.pts.length - 1];
+    if (Math.hypot(p[0] - q[0], p[1] - q[1]) > 10 * dpr) drawing.pts.push(p);
+    return;
+  }
+  if (myDrag) { api.send('input', { type: 'move', shift: e.shiftKey }); return; }
+  // On the name tag: keep it up (and catch the click, to rename).
+  const tag = document.getElementById('moodtag'), tr = tag.classList.contains('on') && tagFor >= 0 ? tag.getBoundingClientRect() : null;
+  overTag = !!tr && e.clientX >= tr.left - 4 && e.clientX <= tr.right + 4 && e.clientY >= tr.top - 4 && e.clientY <= tr.bottom + 4;
+  document.body.classList.toggle('ontag', overTag);
+  const id = overTag ? tagFor : holeAt(e.clientX, e.clientY);
+  setOver(id);
+  setAlt(e.altKey && !overTag ? id : -1);
+});
+// Ctrl + drag from a hole draws a path; let go and it follows it, eating whatever the path runs into.
+let drawing = null;   // { id, pts (physical px) }
+addEventListener('mousedown', e => {
+  if (over < 0 || e.button !== 0 || e.altKey) return;
+  if (overTag) { api.send('rename-prompt', tagFor); return; }
+  if (e.ctrlKey) { drawing = { id: over, pts: [[origin.x + e.clientX * dpr, origin.y + e.clientY * dpr]] }; myDrag = true; return; }
+  myDrag = true;
+  document.body.classList.add('dragging');
+  api.send('input', { type: 'down', id: over });
+});
+addEventListener('mouseup', e => {
+  if (!myDrag || e.button !== 0) return;
+  myDrag = false;
+  if (drawing) {
+    const d = drawing; drawing = null; pathFade = { pts: d.pts, at: performance.now() };
+    if (d.pts.length > 2) api.send('path', d.id, d.pts.slice(0, 600).map(p => p.map(Math.round)));
+    return;
+  }
+  document.body.classList.remove('dragging');
+  api.send('input', { type: 'up' });
+});
+addEventListener('dblclick', e => { if (over >= 0) api.send('input', { type: e.shiftKey ? 'tde' : 'feed', id: over }); });
+addEventListener('wheel', e => { if (over >= 0) api.send('input', { type: 'wheel', id: over, dy: e.deltaY }); }, { passive: true });
+addEventListener('contextmenu', e => { e.preventDefault(); if (over >= 0) api.send('menu', over); });
+// Files dragged onto a hole get eaten. Taking them as a "copy" and then copying nothing means the file itself
+// never moves; the hole eats its icon (and, for things on the desktop, the desktop icon until it's spat back out).
+// Near a hole counts (the same reach main.js uses to make the overlay catchable during a drag).
+function dropAt(clientX, clientY) {
+  for (const v of views(clock())) {
+    if (v.h.deathAt) continue;
+    if (Math.hypot(origin.x + clientX * dpr - v.x, origin.y + clientY * dpr - v.y) < 2.6 * v.rs * 2.5) return v.h.id;
+  }
+  return -1;
+}
+addEventListener('dragover', e => {
+  if (isShare || dropAt(e.clientX, e.clientY) < 0) { e.dataTransfer.dropEffect = 'none'; return; }
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+});
+addEventListener('drop', e => {
+  e.preventDefault();
+  const id = dropAt(e.clientX, e.clientY);
+  if (id < 0) return;
+  const paths = [...e.dataTransfer.files].map(f => { try { return api.pathOf(f); } catch { return ''; } }).filter(Boolean);
+  const x = origin.x + e.clientX * dpr, y = origin.y + e.clientY * dpr;
+  if (paths.length) { api.send('drop-files', id, x, y, paths); return; }
+  // A picture with no file behind it (dragged out of another app): its bytes.
+  const blob = [...e.dataTransfer.files].find(f => /^image\//.test(f.type));
+  if (blob && blob.size < 20e6) { blob.arrayBuffer().then(b => api.send('drop-image-data', id, x, y, new Uint8Array(b), blob.name || 'a picture')); return; }
+  // A picture from a web page: main fetches it (pages can't read other sites' images).
+  const img = new DOMParser().parseFromString(e.dataTransfer.getData('text/html') || '', 'text/html').querySelector('img');
+  const src = img?.getAttribute('src') || '';
+  if (/^(https?:|data:image\/)/i.test(src)) { api.send('drop-image-url', id, x, y, src.slice(0, 4e6), img.getAttribute('alt') || ''); return; }
+  // Text or a link (a browser tab dragged by its address-bar icon, or any link): it eats a picture of it.
+  const url = (e.dataTransfer.getData('text/uri-list') || '').split(/\r?\n/).find(l => l && !l.startsWith('#'));
+  const text = e.dataTransfer.getData('text/plain') || '';
+  const title = (new DOMParser().parseFromString(e.dataTransfer.getData('text/html') || '', 'text/html').body?.textContent || '').trim();
+  if (url && /^https?:/i.test(url)) feedCard(id, x, y, { kind: 'tab', url, title: title && title !== url ? title : '' });
+  else if (text.trim()) feedCard(id, x, y, { kind: 'text', text: text.trim() });
+});
+// A 3D model fed to a hole: main.js sends its triangles; draw them as a glowing wireframe, seen from three-quarters.
+api.on('draw-model', (id, tris) => {
+  const t = tris instanceof Float32Array ? tris : new Float32Array(tris.buffer || tris, tris.byteOffset || 0, (tris.byteLength || tris.length * 4) / 4);
+  const S = Math.round(256 * dpr), c = document.createElement('canvas'), g = c.getContext('2d');
+  c.width = c.height = S;
+  let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < t.length; i += 3) for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], t[i + k]); hi[k] = Math.max(hi[k], t[i + k]); }
+  const ctr = lo.map((l, k) => (l + hi[k]) / 2);
+  let r = 1e-9;
+  for (let i = 0; i < t.length; i += 3) r = Math.max(r, Math.hypot(t[i] - ctr[0], t[i + 1] - ctr[1], t[i + 2] - ctr[2]));
+  const yaw = 0.65, pitch = 0.42, cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch), k = S * 0.44 / r;
+  const proj = i => {
+    const x = t[i] - ctr[0], y = t[i + 1] - ctr[1], z = t[i + 2] - ctr[2];
+    const x1 = x * cy + z * sy, z1 = -x * sy + z * cy, y1 = y * cp - z1 * sp;
+    return [S / 2 + x1 * k, S / 2 - y1 * k];
+  };
+  const n = t.length / 9;
+  g.globalCompositeOperation = 'lighter';
+  g.lineWidth = Math.max(1, dpr * 0.8);
+  g.strokeStyle = `rgba(120,200,255,${Math.min(0.6, Math.max(0.06, 900 / n))})`;
+  for (let s = 0; s < n; s += 400) {
+    g.beginPath();
+    for (let j = s; j < Math.min(n, s + 400); j++) {
+      const [a, b, cc] = [proj(j * 9), proj(j * 9 + 3), proj(j * 9 + 6)];
+      g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.lineTo(cc[0], cc[1]); g.closePath();
+    }
+    g.stroke();
+  }
+  const px = g.getImageData(0, 0, S, S).data;
+  for (let i = 0; i < px.length; i += 4) { const a = px[i + 3] / 255, rr = px[i]; px[i] = px[i + 2] * a; px[i + 1] = px[i + 1] * a; px[i + 2] = rr * a; }   // premultiplied BGRA
+  api.send('model-picture', id, S, S, new Uint8Array(px.buffer));
+});
+
+// Draws what was dropped (a note of the text, or a browser tab) and sends the picture to be eaten.
+function feedCard(holeId, x, y, it) {
+  const s = dpr, W = Math.round((it.kind === 'tab' ? 300 : 280) * s), c = document.createElement('canvas'), g = c.getContext('2d');
+  const font = n => `${n * s}px "Segoe UI Variable Text", "Segoe UI", sans-serif`;
+  let lines = [];
+  if (it.kind === 'text') {   // wrap into at most 9 lines
+    g.font = font(14);
+    for (const para of it.text.slice(0, 1200).split(/\n+/)) {
+      let line = '';
+      for (const word of para.split(/\s+/)) {
+        const t = line ? line + ' ' + word : word;
+        if (g.measureText(t).width > W - 28 * s && line) { lines.push(line); line = word; } else line = t;
+        if (lines.length >= 9) break;
+      }
+      if (line && lines.length < 9) lines.push(line);
+      if (lines.length >= 9) break;
+    }
+  }
+  const H = it.kind === 'tab' ? Math.round(44 * s) : Math.round((22 + lines.length * 20) * s);
+  c.width = W; c.height = H;
+  g.font = font(14); g.textBaseline = 'middle';
+  if (it.kind === 'tab') {   // a browser tab: rounded top, a site letter, the page title
+    const host = (() => { try { return new URL(it.url).hostname.replace(/^www\./, ''); } catch { return it.url; } })();
+    g.fillStyle = '#2b2b2b'; g.beginPath(); g.roundRect(0, 0, W, H + 10 * s, [10 * s, 10 * s, 0, 0]); g.fill();
+    g.fillStyle = '#5b8def'; g.beginPath(); g.arc(20 * s, H / 2, 9 * s, 0, 6.283); g.fill();
+    g.fillStyle = '#fff'; g.font = `600 ${11 * s}px "Segoe UI", sans-serif`; g.textAlign = 'center'; g.fillText(host[0]?.toUpperCase() || '?', 20 * s, H / 2 + 0.5 * s);
+    g.textAlign = 'left'; g.font = font(13); g.fillStyle = '#e8e8e8';
+    let t = it.title || host; while (g.measureText(t).width > W - 64 * s && t.length > 3) t = t.slice(0, -2);
+    g.fillText(t === (it.title || host) ? t : t + '…', 38 * s, H / 2);
+    g.fillStyle = '#9a9a9a'; g.fillText('×', W - 22 * s, H / 2);
+  } else {   // a slip of paper with the words on it
+    g.fillStyle = '#f4f1ea'; g.beginPath(); g.roundRect(0, 0, W, H, 4 * s); g.fill();
+    g.fillStyle = '#2a2622';
+    lines.forEach((l, i) => g.fillText(l, 14 * s, (21 + i * 20) * s));
+  }
+  const img = g.getImageData(0, 0, W, H), px = img.data;
+  for (let i = 0; i < px.length; i += 4) {   // to premultiplied BGRA, like the other things it eats
+    const a = px[i + 3] / 255, r = px[i];
+    px[i] = px[i + 2] * a; px[i + 1] = px[i + 1] * a; px[i + 2] = r * a;
+  }
+  api.send('drop-text', holeId, Math.round(x), Math.round(y), W, H, new Uint8Array(px.buffer),
+           it.kind === 'tab' ? (it.title || it.url).slice(0, 120) : it.text.slice(0, 120), it.kind, it.kind === 'tab' ? it.url.length : it.text.length);
+}
+
+// =====================================================================================================
+//  Every window: desktop capture (whole regions, or just the parts that changed)
+// =====================================================================================================
+let hasScreen = false, lastRequest = 0, lensRect = null, needFull = true, lastChange = 0;
+const capRect = { x: 0, y: 0, w: 1, h: 1 };
+// While the lens sits still and the screen behind it hasn't changed for a couple of seconds, ask for the desktop only
+// a few times a second (the helper answers "unchanged" almost for free, but not asking at all is cheaper still).
+let unchangedRun = 0, lastLensKey = '';
+function requestCapture() {
+  if (!ready || paused) { setTimeout(requestCapture, 100); return; }
+  const lensKey = lensRect ? `${lensRect.x},${lensRect.y},${lensRect.w},${lensRect.h}` : '';
+  if (lensKey !== lastLensKey) { lastLensKey = lensKey; unchangedRun = 0; }
+  const rate = unchangedRun > 2 * (settings.captureRate || 60) ? 4 : settings.captureRate || 60;
+  const wait = 1000 / rate - (performance.now() - lastRequest);
+  if (wait > 0) { setTimeout(requestCapture, wait); return; }
+  if (!lensRect) { setTimeout(requestCapture, 50); return; }   // no hole on this monitor right now
+  lastRequest = performance.now();
+  const r = lensRect;
+  api.send('next-frame', r.x, r.y, r.w, r.h, needFull ? 'full' : 'lens');
+}
+api.on('frame', (x, y, w, h, n, payload) => {
+  requestCapture();   // start the next grab right away so capture overlaps with uploading/rendering
+  if (n === 0) { unchangedRun++; return; }   // nothing changed on screen
+  unchangedRun = 0;
+  gl.bindTexture(gl.TEXTURE_2D, screenTex);
+  if (n === -1) {
+    if (w === screenTexW && h === screenTexH) gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, payload);
+    else { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, payload); screenTexW = w; screenTexH = h; }
+    Object.assign(capRect, { x, y, w, h });
+    needFull = false;
+  } else {
+    if (capRect.x !== x || capRect.y !== y || capRect.w !== w || capRect.h !== h) { needFull = true; return; }
+    const dv = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    for (let i = 0, o = 0; i < n; i++) {
+      const rx = dv.getInt32(o, true), ry = dv.getInt32(o + 4, true), rw = dv.getInt32(o + 8, true), rh = dv.getInt32(o + 12, true);
+      o += 16;
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, rx, ry, rw, rh, gl.RGBA, gl.UNSIGNED_BYTE, payload.subarray(o, o + rw * rh * 4));
+      o += rw * rh * 4;
+    }
+  }
+  gl.generateMipmap(gl.TEXTURE_2D);
+  hasScreen = true;
+  lastChange = performance.now();
+});
+
+// Screenshot: normal screenshots can't see the overlay, so composite it over a capture of this monitor.
+let pendingShot = null;
+api.on('take-screenshot', () => api.send('next-frame', origin.x, origin.y, Math.round(canvas.width / pxScale), Math.round(canvas.height / pxScale), 'shot'));
+api.on('shot-frame', (x, y, w, h, n, pixels) => { if (n === -1) pendingShot = { x, y, w, h, pixels }; });
+function compositeShot() {
+  const { x, y, w, h, pixels } = pendingShot;
+  pendingShot = null;
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  const img = g.createImageData(w, h);
+  for (let i = 0; i < w * h * 4; i += 4) {   // BGRA -> RGBA
+    img.data[i] = pixels[i + 2]; img.data[i + 1] = pixels[i + 1]; img.data[i + 2] = pixels[i]; img.data[i + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  g.drawImage(canvas, origin.x - x, origin.y - y);   // must run right after drawing, before the frame is presented
+  api.send('screenshot', c.toDataURL('image/png'));
+}
+
+// A line of text under a hole (the Recycle Bin's "Nothing is lost.").
+let toastTimer = 0;
+api.on('toast', ({ holeId, text, sub }) => {
+  const v = views(clock()).find(v => v.h.id === holeId);
+  if (!v) return;
+  const x = (v.x - origin.x) / dpr, y = (v.y - origin.y) / dpr + v.rs * 3.4 / dpr;
+  if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) return;   // that hole is on another monitor
+  const el = document.getElementById('toast');
+  el.innerHTML = '';
+  el.append(text);
+  if (sub) { const s = document.createElement('small'); s.textContent = sub; el.append(s); }
+  // Centred under the hole, but kept on screen when the hole sits near an edge.
+  const half = el.offsetWidth / 2 + 16;
+  el.style.left = Math.min(Math.max(x, half), innerWidth - half) + 'px';
+  el.style.top = Math.min(y, innerHeight - el.offsetHeight - 16) + 'px';
+  el.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('on'), 3200);
+});
+
+// Swallowed windows: their image, falling in.
+const SPIT_TIME = 1.6;   // seconds for a spat-out item to unwind back to where it was (main.js SPIT_MS)
+const meals = [];   // { holeId, rect: [x, y, w, h] physical, tex, start, out }: falling in, or (out) being spat back
+// Textures for falling things are reused: the next one of the same size just gets new pixels.
+const texPool = [];
+function freeMealTex(t) { if (texPool.length < 6) texPool.push(t); else gl.deleteTexture(t.tex); }
+function addMeal(info, pixels, out) {
+  const [x, y, w, h] = info.rect;
+  const [tw, th] = info.size || [w, h];   // a file icon's pixels are smaller than the size it's drawn at
+  const i = texPool.findIndex(t => t.w === tw && t.h === th);
+  const pooled = i >= 0 ? texPool.splice(i, 1)[0] : null;
+  const tex = pooled?.tex || gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  if (pooled) gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, tw, th, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, tw, th, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  meals.push({ holeId: info.holeId, key: info.key, rect: [x, y, w, h], tex, tw, th, start: clock(), out, alpha: !!info.alpha });
+}
+api.on('meal', (info, pixels) => addMeal(info, pixels, false));
+// Stolen mid-fall: it's yanked away and falls into the thief instead.
+api.on('steal', (key, toId) => { for (const m of meals) if (m.key === key && !m.out) { m.holeId = toId; m.start = clock(); } });
+// Spat out: the fall played backwards, so it unwinds out of the hole and lands exactly where it was taken from.
+api.on('spit', (info, pixels) => { addMeal(info, pixels, true); if (isLeader) events.push({ type: 'spit' }); });
+
+// =====================================================================================================
+//  Sound (leader only): synthesised, quiet, and tied to the physics
+// =====================================================================================================
+const sound = (() => {
+  let ac = null, master, hum, reverb, wave, purrG, pan, son, dreamS;
+  function noiseBuffer(sec, brown) {
+    const b = ac.createBuffer(1, ac.sampleRate * sec, ac.sampleRate), d = b.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < d.length; i++) {
+      const w = Math.random() * 2 - 1;
+      d[i] = brown ? (last = (last + 0.02 * w) / 1.02) * 3.5 : w;
+    }
+    return b;
+  }
+  function init() {
+    ac = new AudioContext();
+    master = ac.createGain(); master.gain.value = 0;
+    // Positional: the sound sits left or right with where the holes are across your monitors.
+    pan = ac.createPanner();   // spatial: left/right and up/down (HRTF), with where the holes are across the monitors
+    pan.panningModel = 'HRTF'; pan.distanceModel = 'inverse'; pan.refDistance = 1;
+
+    master.connect(pan).connect(ac.destination);
+    // A small room: a convolver with a decaying noise tail, so nothing sounds dry and synthetic.
+    reverb = ac.createConvolver();
+    const ir = ac.createBuffer(2, ac.sampleRate * 2.4, ac.sampleRate);
+    for (let c = 0; c < 2; c++) { const d = ir.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 3.2); }
+    reverb.buffer = ir;
+    const wet = ac.createGain(); wet.gain.value = 0.35;
+    reverb.connect(wet).connect(master);
+    // The hum: brown-noise rumble through a resonant low band, plus a soft low tone. Its pitch falls with mass
+    // (a black hole's natural ringing frequency goes as 1/M), and it swells and opens up when the hole moves.
+    const rumble = ac.createBufferSource(); rumble.buffer = noiseBuffer(4, true); rumble.loop = true;
+    const band = ac.createBiquadFilter(); band.type = 'bandpass'; band.Q.value = 3.5; band.frequency.value = 70;
+    const low = ac.createBiquadFilter(); low.type = 'lowpass'; low.frequency.value = 160;
+    const tone = ac.createOscillator(); tone.type = 'sine'; tone.frequency.value = 41;
+    const toneGain = ac.createGain(); toneGain.gain.value = 0.18;
+    const wob = ac.createOscillator(); wob.frequency.value = 0.13;   // slow beating
+    const wobGain = ac.createGain(); wobGain.gain.value = 1.6;
+    wob.connect(wobGain).connect(tone.frequency);
+    const humGain = ac.createGain(); humGain.gain.value = 0;
+    rumble.connect(band).connect(low).connect(humGain);
+    tone.connect(toneGain).connect(low);
+    humGain.connect(master);
+    humGain.connect(reverb);
+    rumble.start(); tone.start(); wob.start();
+    hum = { band, low, tone, gain: humGain };
+    // The "sonification" sound theme: a deep chord that slowly drifts and moans, pitched to the hole's mass (heavier is
+    // lower), in the spirit of NASA's sonifications of real black holes.
+    son = { gain: ac.createGain(), oscs: [] };
+    son.gain.gain.value = 0;
+    const sf = ac.createBiquadFilter(); sf.type = 'lowpass'; sf.frequency.value = 700; sf.Q.value = 5;
+    for (const [r, type] of [[1, 'sawtooth'], [1.5, 'triangle'], [2.01, 'sawtooth'], [2.997, 'triangle']]) {
+      const o = ac.createOscillator(); o.type = type;
+      const g = ac.createGain(); g.gain.value = 0.25 / r;
+      const lfo = ac.createOscillator(); lfo.frequency.value = 0.05 + 0.04 * r;
+      const lg = ac.createGain(); lg.gain.value = 7 * r;
+      lfo.connect(lg).connect(o.detune);
+      o.connect(g).connect(sf); o.start(); lfo.start();
+      son.oscs.push({ o, r });
+    }
+    const flfo = ac.createOscillator(); flfo.frequency.value = 0.07;
+    const flg = ac.createGain(); flg.gain.value = 450;
+    flfo.connect(flg).connect(sf.frequency); flfo.start();
+    sf.connect(son.gain); son.gain.connect(master); son.gain.connect(reverb);
+    // Dreams have their own sound: a faint, slow, wavering pad.
+    dreamS = { gain: ac.createGain(), oscs: [] };
+    dreamS.gain.gain.value = 0;
+    const dlp = ac.createBiquadFilter(); dlp.type = 'lowpass'; dlp.frequency.value = 900;
+    for (const [f, d] of [[196, -6], [247, 5], [294, -3]]) {
+      const o = ac.createOscillator(); o.frequency.value = f; o.detune.value = d;
+      const v = ac.createOscillator(); v.frequency.value = 0.07 + f / 4000; const vg = ac.createGain(); vg.gain.value = 18;
+      v.connect(vg).connect(o.detune);
+      const g = ac.createGain(); g.gain.value = 0.3;
+      o.connect(g).connect(dlp); o.start(); v.start(); dreamS.oscs.push(o);
+    }
+    dlp.connect(dreamS.gain); dreamS.gain.connect(reverb);
+    // Purr: a low rumble fluttering about 26 times a second.
+    const pn = ac.createBufferSource(); pn.buffer = noiseBuffer(4, true); pn.loop = true;
+    const pf = ac.createBiquadFilter(); pf.type = 'lowpass'; pf.frequency.value = 170;
+    const pam = ac.createGain(); pam.gain.value = 0.5;
+    const lfo = ac.createOscillator(); lfo.frequency.value = 26;
+    const depth = ac.createGain(); depth.gain.value = 0.5;
+    lfo.connect(depth).connect(pam.gain);
+    purrG = ac.createGain(); purrG.gain.value = 0;
+    pn.connect(pf).connect(pam).connect(purrG); purrG.connect(master);
+    pn.start(); lfo.start();
+    // The inspiral voice: a tone that follows the binary's gravitational-wave frequency (twice its orbital frequency,
+    // shifted up into hearing range), getting louder as it rises, the way a real chirp does.
+    const wOsc = ac.createOscillator(); wOsc.type = 'sine'; wOsc.frequency.value = 30;
+    const wLow = ac.createBiquadFilter(); wLow.type = 'lowpass'; wLow.frequency.value = 700;
+    const wGain = ac.createGain(); wGain.gain.value = 0;
+    wOsc.connect(wLow).connect(wGain); wGain.connect(master); wGain.connect(reverb);
+    wOsc.start();
+    wave = { osc: wOsc, gain: wGain };
+  }
+  const env = (g, t, a, peak, d) => { g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(peak, t + a); g.gain.exponentialRampToValueAtTime(0.0001, t + a + d); };
+  function gulp(e) {   // a wet, downward swallow: filtered noise sweeping down plus a soft low thump
+    const t = ac.currentTime, big = e.big ? 1.6 : 1;
+    const src = ac.createBufferSource(); src.buffer = noiseBuffer(0.8, false);
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 7;
+    f.frequency.setValueAtTime(950 / Math.sqrt(e.mass), t); f.frequency.exponentialRampToValueAtTime(110 / Math.sqrt(e.mass), t + 0.38 * big);
+    const g = ac.createGain(); env(g, t, 0.012, 0.22, 0.42 * big);
+    src.connect(f).connect(g); g.connect(master); g.connect(reverb);
+    const o = ac.createOscillator(); o.frequency.setValueAtTime(85, t + 0.05); o.frequency.exponentialRampToValueAtTime(38, t + 0.3);
+    const og = ac.createGain(); env(og, t + 0.04, 0.01, 0.3 * big, 0.3);
+    o.connect(og).connect(master);
+    src.start(t); src.stop(t + 1); o.start(t); o.stop(t + 0.5);
+  }
+  function chirp(e) {   // a merger: the gravitational-wave chirp, frequency ~ (t_c - t)^(-3/8), then a ring-down
+    const t = ac.currentTime, dur = 1.1, n = 200, f = new Float32Array(n), a = new Float32Array(n);
+    const fEnd = 260 / Math.sqrt(e.mass);
+    for (let i = 0; i < n; i++) {
+      const left = Math.max(dur * (1 - i / (n - 1)), 0.004);
+      f[i] = Math.min(fEnd * Math.pow(left / 0.004, -3 / 8) * 1.0, fEnd); a[i] = 0.25 * Math.pow(f[i] / fEnd, 2 / 3);
+    }
+    f[0] = Math.max(f[0], 25);
+    const o = ac.createOscillator(); o.frequency.setValueCurveAtTime(f, t, dur);
+    const g = ac.createGain(); g.gain.setValueCurveAtTime(a, t, dur);
+    g.gain.setValueAtTime(0.25, t + dur); g.gain.exponentialRampToValueAtTime(0.0001, t + dur + 0.45);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900;
+    o.connect(lp).connect(g); g.connect(master); g.connect(reverb);
+    o.frequency.setValueAtTime(fEnd * 0.92, t + dur);
+    o.start(t); o.stop(t + dur + 0.5);
+  }
+  function ringdown(e) {   // after an inspiral the chirp has already played: just the merged hole ringing down
+    const t = ac.currentTime, f = 260 / Math.sqrt(e.mass);
+    const o = ac.createOscillator(); o.frequency.setValueAtTime(f, t); o.frequency.exponentialRampToValueAtTime(f * 0.85, t + 0.5);
+    const g = ac.createGain(); env(g, t, 0.005, 0.26, 0.5);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900;
+    o.connect(lp).connect(g); g.connect(master); g.connect(reverb);
+    o.start(t); o.stop(t + 0.7);
+  }
+  // A hiccup: a tiny, wet blip.
+  // Very quiet mood sounds. tone(): a short glide; hush(): a breath of filtered noise.
+  function tone(t, f0, f1, dur, vol, type = 'sine') {
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    env(g, t, Math.min(0.08, dur * 0.3), vol, dur * 0.7);
+    o.connect(g); g.connect(master); g.connect(reverb); o.start(t); o.stop(t + dur + 0.3);
+    return o;
+  }
+  function hush(t, f0, f1, dur, vol, q = 3) {
+    const src = ac.createBufferSource(); src.buffer = noiseBuffer(dur + 0.2, true);
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = q;
+    f.frequency.setValueAtTime(f0, t); f.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    const g = ac.createGain(); env(g, t, dur * 0.3, vol, dur * 0.7);
+    src.connect(f).connect(g); g.connect(master); g.connect(reverb); src.start(t); src.stop(t + dur + 0.2);
+  }
+  function moodSound(e) {
+    const t = ac.currentTime, k = 1 / Math.sqrt(e.mass || 1);
+    switch (e.mood) {
+      case 'jealous': tone(t, 520 * k, 700 * k, 0.35, 0.02); tone(t + 0.35, 700 * k, 600 * k, 0.3, 0.015); break;   // a little whine
+      case 'sulking': hush(t, 90, 60, 0.9, 0.05, 2); break;                                                         // a low grumble
+      case 'scared': { const o = tone(t, 900 * k, 820 * k, 0.45, 0.012, 'triangle'); const lfo = ac.createOscillator(), lg = ac.createGain(); lfo.frequency.value = 18; lg.gain.value = 40; lfo.connect(lg).connect(o.frequency); lfo.start(t); lfo.stop(t + 0.6); break; }
+      case 'sleepy': hush(t, 700, 400, 1.6, 0.035, 1.2); break;                                                    // a slow breath out
+      case 'hungry': hush(t, 120, 210, 0.5, 0.05, 6); hush(t + 0.45, 210, 90, 0.6, 0.04, 6); break;                // a rumbling stomach
+      case 'excited': tone(t, 600 * k, 900 * k, 0.12, 0.02); tone(t + 0.14, 750 * k, 1100 * k, 0.12, 0.02); break; // two quick chirps
+      case 'queasy': tone(t, 300 * k, 150 * k, 0.45, 0.02, 'triangle'); break;                                     // a wobbly urp
+      case 'bored': hush(t, 900, 300, 1.1, 0.03, 1.5); break;                                                      // a sigh
+      case 'content': tone(t, 220 * k, 220 * k, 0.6, 0.012); tone(t, 330 * k, 330 * k, 0.6, 0.008); break;         // a soft, warm hum
+      case 'floating': for (let i = 0; i < 4; i++) tone(t + i * 0.18, (880 + i * 220) * k, (900 + i * 230) * k, 0.4, 0.008); break;   // a twinkle
+    }
+  }
+  // How what it just ate tasted.
+  function tasteSound(e) {
+    const t = ac.currentTime, k = 1 / Math.sqrt(e.mass || 1);
+    if (e.quality === 'rich') for (const f of [196, 247, 294]) tone(t, f * k, f * k, 0.9, 0.012);           // a warm chord
+    else if (e.quality === 'hearty') tone(t, 70 * k, 45 * k, 0.4, 0.06);                                     // a deep thump
+    else if (e.quality === 'snack') tone(t, 1400 * k, 1100 * k, 0.05, 0.015, 'triangle');                    // a light tick
+    else if (e.quality === 'unsatisfying') tone(t, 520 * k, 260 * k, 0.6, 0.015, 'triangle');                // a hollow, falling whistle
+  }
+  function hic(e) {
+    const t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
+    o.frequency.setValueAtTime(420 / Math.sqrt(e.mass), t); o.frequency.exponentialRampToValueAtTime(160 / Math.sqrt(e.mass), t + 0.09);
+    env(g, t, 0.004, 0.12, 0.08);
+    o.connect(g); g.connect(master); g.connect(reverb); o.start(t); o.stop(t + 0.2);
+  }
+  // Something falling in: a faint tone, redshifted as it goes (gravitational redshift: lower and lower, then gone).
+  function fallTone(e) {
+    const t = ac.currentTime, o = ac.createOscillator(), g = ac.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(330, t); o.frequency.exponentialRampToValueAtTime(40, t + MEAL_TIME * 0.9);
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.035, t + 0.3); g.gain.exponentialRampToValueAtTime(0.0005, t + MEAL_TIME * 0.9);
+    o.connect(g); g.connect(master); g.connect(reverb); o.start(t); o.stop(t + MEAL_TIME);
+  }
+  function spit() {   // the gulp in reverse: a rising, opening rush and a soft pop
+    const t = ac.currentTime;
+    const src = ac.createBufferSource(); src.buffer = noiseBuffer(0.8, false);
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 5;
+    f.frequency.setValueAtTime(140, t); f.frequency.exponentialRampToValueAtTime(1100, t + 0.5);
+    const g = ac.createGain(); g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.16, t + 0.45); g.gain.exponentialRampToValueAtTime(0.0001, t + 0.7);
+    src.connect(f).connect(g); g.connect(master); g.connect(reverb);
+    src.start(t); src.stop(t + 0.8);
+  }
+  function chime() {   // retro mode: a little square-wave arpeggio, the way an 8-bit game says "secret found"
+    const t = ac.currentTime;
+    [523.25, 659.25, 783.99, 1046.5, 1318.5].forEach((f, i) => {
+      const o = ac.createOscillator(); o.type = 'square'; o.frequency.value = f;
+      const g = ac.createGain(); const s = t + i * 0.07;
+      g.gain.setValueAtTime(0.0001, s); g.gain.exponentialRampToValueAtTime(0.06, s + 0.005); g.gain.exponentialRampToValueAtTime(0.0001, s + 0.12);
+      o.connect(g).connect(master); o.start(s); o.stop(s + 0.14);
+    });
+  }
+  // A swallowed song plays from inside the hole: slowed and lowered by gravitational redshift (time runs slower down
+  // there), muffled, with the disk pulsing to its loudness.
+  const songs = new Map();   // key -> { holeId, el, an, buf, level }
+  function music(holeId, key, url) {
+    if (!ac) init();
+    if (songs.has(key)) return;
+    const el = new Audio(url);
+    el.preservesPitch = false;
+    el.playbackRate = 1;
+    const t0 = performance.now(), slide = setInterval(() => {   // gravitational redshift as it falls in
+      const f = Math.min((performance.now() - t0) / (MEAL_TIME * 900), 1);
+      el.playbackRate = 1 - 0.16 * f * f;
+      if (f >= 1) clearInterval(slide);
+    }, 50);
+    const src = ac.createMediaElementSource(el);
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1400; lp.Q.value = 0.8;
+    const g = ac.createGain(); g.gain.value = 0.55;
+    const an = ac.createAnalyser(); an.fftSize = 1024;
+    src.connect(an); src.connect(lp).connect(g); g.connect(master); g.connect(reverb);
+    const song = { holeId, el, an, buf: new Float32Array(an.fftSize), level: 0 };
+    songs.set(key, song);
+    el.addEventListener('ended', () => stopMusic(key));
+    el.play().catch(err => { api.send('log', 'warn', 'could not play swallowed song: ' + err.message); stopMusic(key); });
+  }
+  function stopMusic(key) {
+    const s = songs.get(key);
+    if (!s) return;
+    s.el.pause(); s.el.src = '';
+    songs.delete(key);
+  }
+  function evaporate() {   // a hiss that rises with the Hawking temperature, then the burst: a crack and a low boom
+    const t = ac.currentTime;
+    const src = ac.createBufferSource(); src.buffer = noiseBuffer(EVAPORATE + 0.2, false);
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.Q.value = 1.2;
+    const n = 64, fr = new Float32Array(n), gv = new Float32Array(n);
+    for (let i = 0; i < n; i++) { const s = i / (n - 1), m = Math.cbrt(Math.max(1 - s, 0.02)); fr[i] = Math.min(180 / m, 7000); gv[i] = Math.min(0.012 / (m * m), 0.16); }
+    f.frequency.setValueCurveAtTime(fr, t, EVAPORATE);
+    const g = ac.createGain(); g.gain.setValueCurveAtTime(gv, t, EVAPORATE);
+    src.connect(f).connect(g); g.connect(master); g.connect(reverb);
+    src.start(t); src.stop(t + EVAPORATE + 0.1);
+    const tb = t + EVAPORATE;
+    const crack = ac.createBufferSource(); crack.buffer = noiseBuffer(0.12, false);
+    const cg = ac.createGain(); env(cg, tb, 0.003, 0.35, 0.1);
+    crack.connect(cg); cg.connect(master); cg.connect(reverb);
+    const boom = ac.createOscillator(); boom.frequency.setValueAtTime(70, tb); boom.frequency.exponentialRampToValueAtTime(28, tb + 0.9);
+    const bg = ac.createGain(); env(bg, tb, 0.01, 0.45, 1.1);
+    boom.connect(bg); bg.connect(master); bg.connect(reverb);
+    crack.start(tb); crack.stop(tb + 0.2); boom.start(tb); boom.stop(tb + 1.3);
+  }
+  return {
+    music, stopMusic,
+    level(holeId) {   // loudness of whatever's playing inside this hole, 0..1
+      let lv = 0;
+      for (const s of songs.values()) {
+        if (s.holeId !== holeId) continue;
+        s.an.getFloatTimeDomainData(s.buf);
+        let sum = 0; for (const x of s.buf) sum += x * x;
+        lv = Math.max(lv, Math.min(Math.sqrt(sum / s.buf.length) * 3.2, 1));
+      }
+      return lv;
+    },
+    update(vs, evs, on, volume) {
+      if (!on) { if (ac) master.gain.setTargetAtTime(0, ac.currentTime, 0.1); return; }
+      if (!ac) init();
+      if (ac.state === 'suspended') ac.resume();
+      const t = ac.currentTime;
+      master.gain.setTargetAtTime(volume * 0.5 * (1 - 0.65 * focus), t, 0.3);   // typing a lot: quieter
+      const live = vs.filter(v => !v.h.deathAt);
+      const purr = live.reduce((m, v) => Math.max(m, v.h.purr || 0), 0);
+      purrG.gain.setTargetAtTime(purr * 0.16, t, 0.3);
+      const mass = live.length ? Math.max(...live.map(v => v.h.mass)) : 1;
+      const speed = live.length ? Math.min(5000, Math.max(...live.map(v => Math.hypot(v.h.vx, v.h.vy) || 0))) : 0;
+      const sonic = settings.soundTheme === 'sonification';
+      hum.gain.gain.setTargetAtTime(live.length ? (0.05 + Math.min(speed / 3000, 0.12)) * (1 - 0.5 * purr) * (sonic ? 0.35 : 1) : 0, t, 0.25);
+      son.gain.gain.setTargetAtTime(sonic && live.length ? 0.07 : 0, t, 0.6);
+      for (const s of son.oscs) s.o.frequency.setTargetAtTime(55 / Math.sqrt(mass) * s.r, t, 0.5);
+      // Stereo position: the mass-weighted middle of the holes, across the whole span of monitors.
+      if (live.length && displays.length) {
+        const x0 = Math.min(...displays.map(d => d.phys.x)), x1 = Math.max(...displays.map(d => d.phys.x + d.phys.width));
+        const mx = live.reduce((s, v) => s + v.h.x * v.h.mass, 0) / live.reduce((s, v) => s + v.h.mass, 0);
+        const y0 = Math.min(...displays.map(d => d.phys.y)), y1 = Math.max(...displays.map(d => d.phys.y + d.phys.height));
+        const my = live.reduce((s, v) => s + v.h.y * v.h.mass, 0) / live.reduce((s, v) => s + v.h.mass, 0);
+        const px = ((mx - x0) / Math.max(x1 - x0, 1) * 2 - 1) * 1.6, py = -((my - y0) / Math.max(y1 - y0, 1) * 2 - 1) * 1.0;
+        pan.positionX.setTargetAtTime(px, t, 0.2); pan.positionY.setTargetAtTime(py, t, 0.2); pan.positionZ.setTargetAtTime(-1, t, 0.2);
+      }
+      const dream = live.reduce((m, v) => Math.max(m, v.h.dream || 0), 0);
+      dreamS.gain.gain.setTargetAtTime(dream * 0.05, t, 1.5);
+      hum.band.frequency.setTargetAtTime(70 / Math.sqrt(mass) + speed * 0.03, t, 0.2);
+      hum.low.frequency.setTargetAtTime(160 + speed * 0.12, t, 0.2);
+      hum.tone.frequency.setTargetAtTime(41 / Math.sqrt(mass), t, 0.4);
+      // The loudest binary's chirp: GW frequency (0.9 to ~15 Hz here) times 18 lands it at roughly 16 to 280 Hz.
+      const B = binaries.reduce((best, b) => !best || b.f > best.f ? b : best, null);
+      if (B) {
+        wave.osc.frequency.setTargetAtTime(Math.min(B.f * 18, 400), t, 0.03);
+        wave.gain.gain.setTargetAtTime(Math.min(0.03 * Math.pow(B.f / 0.9, 2 / 3), 0.22), t, 0.05);
+      } else wave.gain.gain.setTargetAtTime(0, t, 0.04);
+      if (evs.length) ownSoundUntil = clock() + 1200;
+      for (const e of evs) {
+        if (e.type === 'gulp' || e.type === 'tde') { gulp(e); if (e.fall) fallTone(e); }
+        else if (e.type === 'spit') spit();
+        else if (e.type === 'hic') hic(e);
+        else if (e.type === 'mood') moodSound(e);
+        else if (e.type === 'taste') tasteSound(e);
+        else if (e.type === 'retro') chime();
+        else if (e.type === 'merge') (e.inspiral ? ringdown : chirp)(e);
+        else if (e.type === 'evaporate') evaporate();
+      }
+    },
+  };
+})();
+
+// =====================================================================================================
+//  Every window: drawing
+// =====================================================================================================
+const UA = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'].map(() => new Float32Array(4 * MAXH));
+const MB = new Float32Array(4 * MAXH), MR = new Float32Array(4 * MAXH);
+let last = performance.now(), lastDraw = 0, frames = 0, fpsAt = performance.now(), flatBg = [0, 0, 0];
+const prevPos = new Map();   // hole id -> last drawn position, for motion blur
+const halton = (i, b) => { let f = 1, r = 0; while (i > 0) { f /= b; r += f * (i % b); i = Math.floor(i / b); } return r; };
+let jitterAt = 0;
+
+// Dynamic resolution: track how long frames take while it's busy, and step the render scale down when it falls behind
+// the display (or up when it's comfortably ahead). Settings can also pin it.
+let lastBusyAt = 0;
+// Where the GPU supports it, time the ray tracing itself (results arrive a frame or two later): a far better guide
+// than frame-to-frame time, which also includes waiting for the display.
+// (not in previews: asking for timings waits on the graphics process, which would stall the Settings page around it)
+const gpuTimer = new URLSearchParams(location.search).has('icon') ? null : gl.getExtension('EXT_disjoint_timer_query_webgl2');
+const gpuQueries = [];
+let gpuMs = -1;
+function gpuBegin() {
+  if (!gpuTimer || gpuQueries.length > 4) return null;
+  const q = gl.createQuery();
+  gl.beginQuery(gpuTimer.TIME_ELAPSED_EXT, q);
+  return q;
+}
+function gpuEnd(q) { if (q) { gl.endQuery(gpuTimer.TIME_ELAPSED_EXT); gpuQueries.push(q); } }
+function gpuPoll() {
+  if (!gpuTimer) return;
+  if (gl.getParameter(gpuTimer.GPU_DISJOINT_EXT)) { for (const q of gpuQueries) gl.deleteQuery(q); gpuQueries.length = 0; return; }
+  while (gpuQueries.length && gl.getQueryParameter(gpuQueries[0], gl.QUERY_RESULT_AVAILABLE)) {
+    const q = gpuQueries.shift(), ms = gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6;
+    gl.deleteQuery(q);
+    gpuMs = gpuMs < 0 ? ms : gpuMs * 0.85 + ms * 0.15;
+  }
+}
+function adaptQuality(nowMs) {
+  const q = settings.quality || 'auto';
+  let target = { high: 1, balanced: 0.75, performance: 0.55 }[q] ?? rscale;
+  gpuPoll();
+  // With GPU timing, only real GPU time counts (frame-to-frame time also includes things a lower resolution can't fix).
+  if (q === 'auto' && nowMs - lastBusyAt < 100 && !(gpuTimer && gpuMs < 0)) {
+    const hz = displayAt(origin.x + 2, origin.y + 2)?.hz || 60, budget = 1000 / Math.min(hz, 144);   // (no need to chase 240 Hz)
+    // GPU time of the expensive passes (with headroom for everything else), or else the time between frames.
+    const took = gpuMs >= 0 ? gpuMs * 1.6 : nowMs - lastBusyAt;
+    if (took > budget * 1.45) { slowFrames++; fastFrames = 0; } else if (took < budget * 1.15) { fastFrames++; slowFrames = Math.max(0, slowFrames - 1); }
+    if (slowFrames > 20) { target = Math.max(0.5, rscale * 0.85); slowFrames = 0; }
+    if (fastFrames > 240 && rscale < 1) { target = Math.min(1, rscale / 0.85); fastFrames = 0; }
+  }
+  lastBusyAt = nowMs;
+  if (Math.abs(target - rscale) > 0.01) { rscale = target; makeTargets(); }
+}
+
+let iconFrameAt = 0;
+const ICON_PAGE = new URLSearchParams(location.search).has('icon');
+function frame(nowMs) {
+  requestAnimationFrame(frame);
+  if (ICON_PAGE && !previewDemo && nowMs - iconFrameAt < 33) return;   // previews: 30 frames a second is plenty
+  iconFrameAt = nowMs;
+  let dt = Math.min((nowMs - last) / 1000, 0.1);
+  last = nowMs;
+  // The window is enlarged over the taskbar after the page starts, and 'resize' doesn't always fire for that.
+  if (canvas.width !== Math.max(1, Math.round(innerWidth * devicePixelRatio)) || canvas.height !== Math.max(1, Math.round(innerHeight * devicePixelRatio))) resize();
+  if (!ready) return;
+  if (paused) return;
+  if (isLeader) {
+    music = listen.sample(settings.danceToMusic !== false && !paused, dt);
+    while (dt > 0) { const s = Math.min(dt, 1 / 240); physics(s); dt -= s; }
+    probeWhileDragging(clock());
+    const allGone = hadHoles && holes.length === 0;
+    api.send('state', { t: clock(), holes, allGone });
+  }
+
+  const t = clock(), ts = (t / 1000) % 3600;   // wrapped for float precision (the swirl only depends on t mod 6 s)
+  const vs = views(t).filter(v => v.fade > 0);
+  moodTag(vs, t);
+  uiLayer();   // (the blueprint is redrawn every frame, so it follows the holes)
+  if (previewDemo && !partsAt) for (let k = 0; k < 150; k++) particles(vs, t, 0.02);
+  particles(vs, t);
+  if (isLeader) { sound.update(vs, events.splice(0), !!settings.sound, +settings.volume || 0); }
+
+  // Idle: nothing moving, nothing animating, and the screen behind not changing -> draw less (or not at all).
+  const busy = vs.some(v => Math.hypot(v.h.vx, v.h.vy) > 2 || Math.abs(v.h.tvx) + Math.abs(v.h.tvy) > 0.02 || v.feed >= 0 ||
+      v.tde >= 0 || v.wave >= 0 || v.h.deathAt || v.h.retro > 0 || v.h.pulse > 0.01 || v.h.bored > 0.01 && v.h.boredTarget || v.fade < 0.999 && !v.h.ghostOn || Math.abs(v.h.ghost - (v.h.ghostOn ? 1 : 0)) > 0.01 || v.h.hunger > 0.01
+      || v.h.dance > 0.02 || v.h.purr > 0.02 || v.h.nausea > 0.01 || Math.abs(v.h.park - (v.h.parked ? 1 : 0)) > 0.01 || v.h.walk)
+      || meals.length > 0 || nowMs - lastChange < 400 || pendingShot || drag;
+  if (!busy && !isShare) {
+    if (settings.idle === 'freeze' && lastDraw) return;
+    if (nowMs - lastDraw < 1000 / 20) return;
+  }
+  lastDraw = nowMs;
+  if (++frames && nowMs - fpsAt >= 1000) { if (isLeader) api.send('stats', { fps: Math.round(frames * 1000 / (nowMs - fpsAt)) }); frames = 0; fpsAt = nowMs; }
+
+  // Which part of this view needs the lens (and so the capture).
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const v of vs) {
+    const r = LENS * v.rs + 64;
+    x0 = Math.min(x0, v.x - r + v.h.vx * 0.04); y0 = Math.min(y0, v.y - r + v.h.vy * 0.04);
+    x1 = Math.max(x1, v.x + r + v.h.vx * 0.04); y1 = Math.max(y1, v.y + r + v.h.vy * 0.04);
+  }
+  const vw = isShare ? origin.width : canvas.width, vh = isShare ? origin.height : canvas.height;
+  if (isShare) { x0 = origin.x; y0 = origin.y; x1 = origin.x + vw; y1 = origin.y + vh; }
+  x0 = Math.max(Math.round(x0), origin.x); y0 = Math.max(Math.round(y0), origin.y);
+  x1 = Math.min(Math.round(x1), origin.x + vw); y1 = Math.min(Math.round(y1), origin.y + vh);
+  lensRect = x1 > x0 && y1 > y0 ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } : null;
+  if (busy && unchangedRun > 0) unchangedRun = 0;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if (!lensRect && !isShare) { prevPos.clear(); if (T) T.histOk = false; if (pendingShot) compositeShot(); return; }
+
+  const gpuQ = gpuBegin();
+  // ---- 1. the scene: ray-traced holes (at the render scale) ----
+  const k = pxScale, H = canvas.height, kr = k * rscale, Hr = T.H;
+  vs.forEach((v, i) => {
+    const L = lookOf(v.h), ph = v.h.id * 1.7, md = moodOf(v.h);   // each hole wobbles on its own phase
+    UA[0].set([(v.x - origin.x) * kr, Hr - (v.y - origin.y) * kr, v.rs * kr, v.mass], i * 4);
+    const hp = (clock() - (v.h.helloAt || 0)) / 1600, hello = hp >= 0 && hp < 1 ? 0.14 * Math.sin(hp * 6.283 * 3) * (1 - hp) : 0;
+    UA[1].set([L.tilt + 0.1 * (v.h.yawn || 0) + hello + v.h.tilty * 0.8 + 0.02 * md.wobble * Math.sin(ts * 0.45 + ph), -v.h.tiltx + 0.03 * md.wobble * Math.sin(ts * 0.6 + ph) + 0.07 * (v.h.sway || 0), v.hawkOn, v.burst], i * 4);
+    UA[2].set([v.fade, v.feed, v.wave, rsBase(v.h) * kr], i * 4);
+    const qz = 0.22 * (v.h.nausea || 0), green = [1.0, 2.6, 0.7];   // queasy: very slightly green
+    UA[3].set([...L.coef.map((c, j) => c + (green[j] - c) * qz), L.heat * md.heat * (1 + 1.8 * (v.h.pulse || 0)) * (1 + 0.6 * (v.h.beat || 0) * (v.h.dance || 0))], i * 4);
+    const yawn = v.h.yawn || 0;   // yawning: the disk stretches out and puffs up for a moment
+    UA[4].set([L.spin, L.isco, L.horizon, L.thickness + 0.08 * yawn], i * 4);
+    UA[5].set([L.on ? L.outer * (1 + 0.18 * yawn) : 0, L.alpha, L.on, L.omega * md.omega], i * 4);
+    // corona: brighter the more it's eating, with a surge right after a meal
+    const corona = Math.min(1, 0.15 + 2.5 * (v.h.accr || 0) + (v.feed >= 0 ? 0.7 * Math.exp(-v.feed) : 0));
+    UA[9].set([v.h.align || 0, corona, L.castShadow ? 1 : 0, 0], i * 4);
+    UA[8].set([v.h.dream || 0, Math.min(1, 0.12 + 1.5 * (v.h.accr || 0) + (v.h.wind || 0)), v.h.groom || 0, /^gargantua$/i.test((v.h.name || '').trim()) ? 1 : 0], i * 4);
+    const retroLv = Math.max(L.retroSkin ? 1 : 0, Math.min((v.h.retro || 0) * 4, 1) * Math.min((30 - (v.h.retro || 0)) * 8 + 0.0001, 1) * (v.h.retro > 0 ? 1 : 0));
+    // Hunger glow; a bored hole glows faintly, slowly, like it's breathing.
+    // A very hungry one has a slow, gentle pulse (an "I'm hungry" you can ignore).
+    const glow = Math.max(v.h.hunger || 0, (v.h.bored || 0) * 0.35 * (0.5 + 0.5 * Math.sin(ts * 1.3 + ph)),
+                          Math.max(0, ((v.h.appetite ?? 0) - 0.75) / 0.25) * 0.25 * (0.5 + 0.5 * Math.sin(ts * 0.8 + ph)));
+    UA[6].set([v.tde, L.star, glow, retroLv], i * 4);
+    UA[7].set([L.fxBits, previewDemo ? 1 : 0, L.grade, L.doppler], i * 4);
+  });
+  // Swallowed windows first, into their own layer: the ray tracer treats them as part of what's behind.
+  let hasMeal = false;
+  if (meals.length) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, T.fmeal);
+    gl.viewport(0, 0, T.W, T.H);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(P.meal);
+    gl.bindVertexArray(mealVao);
+    gl.activeTexture(gl.TEXTURE0);
+    for (let i = meals.length - 1; i >= 0; i--) {
+      const m = meals[i], el = (t - m.start) / 1000, v = vs.find(v => v.h.id === m.holeId);
+      if (el > (m.out ? SPIT_TIME : MEAL_TIME * 0.93) || !v) { freeMealTex({ tex: m.tex, w: m.tw, h: m.th }); meals.splice(i, 1); continue; }
+      const age = m.out ? MEAL_TIME * (1 - el / SPIT_TIME) : el;
+      gl.bindTexture(gl.TEXTURE_2D, m.tex);
+      gl.uniform1i(P.meal.u('uTex'), 0);
+      gl.uniform1i(P.meal.u('uAlpha'), m.alpha ? 1 : 0);
+      gl.uniform4f(P.meal.u('uRect'), (m.rect[0] - origin.x) * kr, (m.rect[1] - origin.y) * kr, m.rect[2] * kr, m.rect[3] * kr);
+      gl.uniform2f(P.meal.u('uHole'), (v.x - origin.x) * kr, (v.y - origin.y) * kr);
+      gl.uniform1f(P.meal.u('uT'), age);
+      gl.uniform1f(P.meal.u('uRs'), v.rs * kr);
+      // Frame dragging: a spinning hole drags space round with it, so what falls in is twisted the way it turns.
+      gl.uniform1f(P.meal.u('uSpin'), 0.4 + 1.4 * lookOf(v.h).spin);
+      gl.uniform1f(P.meal.u('uTide'), Math.min(Math.max(1 / (v.h.mass * v.h.mass), 0.25), 1.6));
+      gl.uniform1f(P.meal.u('uWhite'), lookOf(v.h).fxBits & FXB.white ? 1 : 0);
+      gl.uniform2f(P.meal.u('uRes'), T.W, T.H);
+      gl.drawElements(gl.TRIANGLES, GRID * GRID * 6, gl.UNSIGNED_SHORT, 0);
+      hasMeal = true;
+    }
+    gl.disable(gl.BLEND);
+  }
+
+  // Only the part of the view the holes (and anything falling in) cover gets traced and filtered.
+  let sx0 = Infinity, sy0 = Infinity, sx1 = -Infinity, sy1 = -Infinity;
+  const grow = (x0, y0, x1, y1) => { sx0 = Math.min(sx0, x0); sy0 = Math.min(sy0, y0); sx1 = Math.max(sx1, x1); sy1 = Math.max(sy1, y1); };
+  for (const v of vs) { const r = (LENS * v.rs + 48) * kr, cx = (v.x - origin.x) * kr, cy = Hr - (v.y - origin.y) * kr; grow(cx - r, cy - r, cx + r, cy + r); }
+  for (const m of meals) grow((m.rect[0] - origin.x) * kr, Hr - (m.rect[1] + m.rect[3] - origin.y) * kr, (m.rect[0] + m.rect[2] - origin.x) * kr, Hr - (m.rect[1] - origin.y) * kr);
+  sx0 = Math.max(0, Math.floor(sx0)); sy0 = Math.max(0, Math.floor(sy0)); sx1 = Math.min(T.W, Math.ceil(sx1)); sy1 = Math.min(T.H, Math.ceil(sy1));
+  const scis = sx1 > sx0 && sy1 > sy0 ? [sx0, sy0, sx1 - sx0, sy1 - sy0] : [0, 0, 1, 1];
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, T.scene);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+  gl.viewport(0, 0, T.W, T.H);
+  gl.clearBufferfv(gl.COLOR, 0, [0, 0, 0, 0]);
+  gl.clearBufferfv(gl.COLOR, 1, [0, 0, 0, 0]);
+  gl.enable(gl.SCISSOR_TEST); gl.scissor(...scis);
+  P.scene = sceneProgram(vs.reduce((m, v) => m | lookOf(v.h).fxBits, 0) & ~(FXB.pixel | FXB.dust | FXB.snow));
+  gl.useProgram(P.scene);
+  gl.bindVertexArray(triVao);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, T.meal);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, screenTex);
+  const S = P.scene;
+  gl.uniform1i(S.u('uScreen'), 0);
+  gl.uniform1i(S.u('uMeal'), 1);
+  gl.uniform1i(S.u('uHasMeal'), hasMeal ? 1 : 0);
+  gl.uniform1i(S.u('uN'), vs.length);
+  ['uA', 'uB', 'uC', 'uD', 'uE', 'uF', 'uG', 'uH', 'uI', 'uJ'].forEach((n, i) => gl.uniform4fv(S.u(n), UA[i]));
+  dreamSlots(vs);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, dreamTex);
+  gl.uniform1i(S.u('uDream'), 3);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, wormTex);
+  gl.uniform1i(S.u('uWorm'), 2);
+  gl.uniform1i(S.u('uHasWorm'), hasWorm ? 1 : 0);
+  gl.uniform1f(S.u('uStep'), { performance: 1.6, balanced: 1.3 }[settings.quality] || (rscale < 0.7 ? 1.3 : 1));
+  gl.uniform1f(S.u('uTime'), settings.idle === 'freeze' && !busy ? 0 : ts);
+  gl.uniform2f(S.u('uRes'), T.W, T.H);
+  gl.uniform1f(S.u('uPxScale'), kr);
+  gl.uniform2f(S.u('uWinOrigin'), origin.x, origin.y);
+  gl.uniform2f(S.u('uCapOrigin'), capRect.x, capRect.y);
+  gl.uniform2f(S.u('uCapSize'), capRect.w, capRect.h);
+  gl.uniform1i(S.u('uHasScreen'), hasScreen ? 1 : 0);
+  gl.uniform1i(S.u('uShare'), isShare ? 1 : 0);
+  gl.uniform3fv(S.u('uFlatBg'), flatBg);
+  jitterAt = (jitterAt + 1) % 8;
+  gl.uniform2f(S.u('uJitter'), halton(jitterAt + 1, 2) - 0.5, halton(jitterAt + 1, 3) - 0.5);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // Temporal anti-aliasing: blend this frame into the running history.
+  const histOut = T.histAt ^ 1;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, T.fhist[histOut]);
+  gl.viewport(0, 0, T.W, T.H);
+  gl.useProgram(P.taa);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, T.hist[T.histAt]);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, T.color);
+  gl.uniform1i(P.taa.u('uCur'), 0); gl.uniform1i(P.taa.u('uHist'), 1);
+  gl.uniform2f(P.taa.u('uRes'), T.W, T.H);
+  gl.uniform1f(P.taa.u('uBlend'), 0.15);
+  gl.uniform1i(P.taa.u('uReset'), T.histOk ? 0 : 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.disable(gl.SCISSOR_TEST);
+  T.histAt = histOut; T.histOk = true;
+  gpuEnd(gpuQ);
+
+  // ---- 3. bloom: the bright light, downsampled and blurred at two scales ----
+  const bloomAmt = +settings.bloom || 0;
+  if (bloomAmt > 0) {
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+    const pass = (prog, fbo, w, h, src, setup) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo); gl.viewport(0, 0, w, h);
+      gl.useProgram(prog); gl.bindTexture(gl.TEXTURE_2D, src); gl.uniform1i(prog.u('uSrc'), 0);
+      setup(); gl.drawArrays(gl.TRIANGLES, 0, 3);
+    };
+    pass(P.copy, T.fa1, T.w4, T.h4, T.bright, () => gl.uniform2f(P.copy.u('uTexel'), 1 / T.w4, 1 / T.h4));
+    for (const [fa, ta, fb, tb, w, h] of [[T.fa2, T.a2, T.fa1, T.a1, T.w4, T.h4]]) {
+      pass(P.blur, fa, w, h, T.a1, () => { gl.uniform2f(P.blur.u('uDir'), 1, 0); gl.uniform2f(P.blur.u('uSize'), w, h); });
+      pass(P.blur, fb, w, h, ta, () => { gl.uniform2f(P.blur.u('uDir'), 0, 1); gl.uniform2f(P.blur.u('uSize'), w, h); });
+    }
+    pass(P.copy, T.fb1, T.w8, T.h8, T.a1, () => gl.uniform2f(P.copy.u('uTexel'), 1 / T.w8, 1 / T.h8));
+    pass(P.blur, T.fb2, T.w8, T.h8, T.b1, () => { gl.uniform2f(P.blur.u('uDir'), 1, 0); gl.uniform2f(P.blur.u('uSize'), T.w8, T.h8); });
+    pass(P.blur, T.fb1, T.w8, T.h8, T.b2, () => { gl.uniform2f(P.blur.u('uDir'), 0, 1); gl.uniform2f(P.blur.u('uSize'), T.w8, T.h8); });
+  }
+
+  // ---- 4. composite to the window: scene + motion blur + bloom (+ the desktop, in the share view) ----
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(P.comp);
+  const C = P.comp;
+  [[T.hist[T.histAt], 'uScene'], [T.a1, 'uBloomA'], [T.b1, 'uBloomB'], [screenTex, 'uScreen'], [T.meal, 'uMeal']].forEach(([tex, n], i) => {
+    gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(C.u(n), i);
+  });
+  gl.uniform1i(C.u('uHasMeal'), hasMeal ? 1 : 0);
+  vs.forEach((v, i) => {
+    const pp = prevPos.get(v.h.id) || { x: v.x, y: v.y };
+    // Velocity over the frame, scaled to a camera's typical half-frame exposure; only when it's really moving.
+    const mvx = settings.motionBlur ? (v.x - pp.x) * k * 0.5 : 0, mvy = settings.motionBlur ? -(v.y - pp.y) * k * 0.5 : 0;
+    MB.set([(v.x - origin.x) * k, H - (v.y - origin.y) * k, mvx, mvy], i * 4);
+    MR.set([LENS * v.rs * k, 0, 0, 0], i * 4);
+  });
+  prevPos.clear(); for (const v of vs) prevPos.set(v.h.id, { x: v.x, y: v.y });
+  gl.uniform1i(C.u('uN'), vs.length);
+  gl.uniform4fv(C.u('uMB'), MB); gl.uniform4fv(C.u('uMR'), MR);
+  gl.uniform2f(C.u('uRes'), canvas.width, canvas.height);
+  gl.uniform1f(C.u('uBloomAmt'), bloomAmt * (floatTargets ? 1 : 4));
+  gl.uniform1i(C.u('uShare'), isShare ? 1 : 0);
+  gl.uniform2f(C.u('uWinOrigin'), origin.x, origin.y);
+  gl.uniform2f(C.u('uCapOrigin'), capRect.x, capRect.y);
+  gl.uniform2f(C.u('uCapSize'), capRect.w, capRect.h);
+  gl.uniform1f(C.u('uPxScale'), k);
+  if (!isShare) {
+    const pad = 40, c0 = scis.map(x => x / rscale);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.scissor(Math.max(0, Math.floor(c0[0] - pad)), Math.max(0, Math.floor(c0[1] - pad)), Math.ceil(c0[2] + 2 * pad), Math.ceil(c0[3] + 2 * pad));
+  }
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.disable(gl.SCISSOR_TEST);
+  adaptQuality(nowMs);
+  gl.activeTexture(gl.TEXTURE0);
+
+  if (pendingShot) compositeShot();
+}
+
+// =====================================================================================================
+//  Wiring
+// =====================================================================================================
+const query = new URLSearchParams(location.search);
+if (query.has('icon')) {
+  // Icon mode (tools/make-icon.js): one still hole in the middle of a flat background, no desktop, no IPC.
+  flatBg = query.get('icon') === 'white' ? [1, 1, 1] : [0, 0, 0];
+  settings = { look: 'classic', size: +query.get('size') || 1, diskColor: '#ff280a', diskTemp: 0.5, thickness: 0.06,
+               tilt: +query.get('tilt') || 7, spinSpeed: 0, bhSpin: 0.7, bloom: 0, motionBlur: false, einsteinStar: false,
+               sound: false, idle: 'slow', captureRate: 60, danceToMusic: false };
+  displays = [{ id: 0, primary: true, scale: 1, phys: { x: 0, y: 0, width: innerWidth, height: innerHeight } }];
+  isLeader = true;
+  let pet = {};
+  try { pet = JSON.parse(query.get('pet') || '{}'); } catch {}
+  // (portraits and share cards: the hole's whole look, as it is on the desktop)
+  for (const k of ['look', 'diskColor', 'diskTemp', 'thickness', 'retroSkin', 'fx', 'bloom', 'grade', 'dopplerColor', 'einsteinStar']) if (k in pet) settings[k] = pet[k];
+  // Previews (Settings): a dark grid behind it so the bending shows, a stand-in "other monitor" for the wormhole,
+  // and the glitch / dust trail shown in action.
+  previewDemo = query.has('demo');
+  // A live preview inside Settings: it's sent each new look as you change it.
+  addEventListener('message', e => {
+    const p = e.data?.type === 'accretion-look' && e.data.pet;
+    if (!p || typeof p !== 'object') return;
+    for (const k of ['look', 'diskColor', 'diskTemp', 'thickness', 'retroSkin', 'fx', 'bloom', 'grade', 'dopplerColor', 'einsteinStar', 'tilt', 'spinSpeed', 'castShadow'])
+      if (k in p && (typeof p[k] === typeof settings[k] || settings[k] === undefined)) settings[k] = p[k];
+    const g = holes[0];
+    if (g) { if (Number.isFinite(p.spin)) g.spin = p.spin; g.rare = typeof p.rare === 'string' ? p.rare : null; g.name = typeof p.name === 'string' ? p.name : ''; }
+  });
+  if (query.get('bg') === 'grid') {
+    // (never zero: a preview hidden on another tab has no size yet, and the grid below steps by W / 12)
+    const W = Math.max(64, Math.round(innerWidth * devicePixelRatio)), Hh = Math.max(64, Math.round(innerHeight * devicePixelRatio));
+    const cv = Object.assign(document.createElement('canvas'), { width: W, height: Hh }), c2 = cv.getContext('2d');
+    const gr = c2.createLinearGradient(0, 0, W, Hh); gr.addColorStop(0, '#141a2c'); gr.addColorStop(1, '#0b0d14');
+    c2.fillStyle = gr; c2.fillRect(0, 0, W, Hh);
+    c2.strokeStyle = 'rgba(150,170,220,0.22)'; c2.lineWidth = Math.max(1, W / 300);
+    for (let g = 0; g <= W; g += W / 12) { c2.beginPath(); c2.moveTo(g, 0); c2.lineTo(g, Hh); c2.stroke(); }
+    for (let g = 0; g <= Hh; g += Hh / 12) { c2.beginPath(); c2.moveTo(0, g); c2.lineTo(W, g); c2.stroke(); }
+    const px = c2.getImageData(0, 0, W, Hh).data;
+    for (let i = 0; i < px.length; i += 4) { const r = px[i]; px[i] = px[i + 2]; px[i + 2] = r; }   // the shader reads BGRA
+    gl.bindTexture(gl.TEXTURE_2D, screenTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, Hh, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(px.buffer));
+    gl.generateMipmap(gl.TEXTURE_2D);
+    Object.assign(capRect, { x: 0, y: 0, w: W, h: Hh });
+    hasScreen = true;
+  }
+  if ((pet.fx || []).includes('wormhole')) {
+    const cv = Object.assign(document.createElement('canvas'), { width: 320, height: 180 }), c2 = cv.getContext('2d');
+    const gr = c2.createLinearGradient(0, 0, 320, 180); gr.addColorStop(0, '#3a6ea5'); gr.addColorStop(1, '#a5537a');
+    c2.fillStyle = gr; c2.fillRect(0, 0, 320, 180);
+    for (const [x, y, w, hh, c] of [[30, 25, 150, 100, '#f3f3f3'], [150, 60, 140, 95, '#202020'], [40, 140, 240, 18, '#1b1b1b']]) {
+      c2.fillStyle = c; c2.fillRect(x, y, w, hh); c2.fillStyle = '#0078d4'; c2.fillRect(x, y, w, 8);
+    }
+    const px = c2.getImageData(0, 0, 320, 180).data;
+    for (let i = 0; i < px.length; i += 4) { const r = px[i]; px[i] = px[i + 2]; px[i + 2] = r; }
+    uploadWorm(320, 180, new Uint8Array(px.buffer));
+  }
+  holes = [{ ...newHole(innerWidth / 2, innerHeight / 2), born: 0, appear: 0, spin: Number.isFinite(pet.spin) ? pet.spin : 0.7,
+               rare: typeof pet.rare === 'string' ? pet.rare : null, name: typeof pet.name === 'string' ? pet.name : '' }];
+  api.send = () => {};
+  ready = true;
+}
+// Particles around a hole, drawn on a 2D layer above the ray-traced picture: a dust trail when it moves, and
+// snow (December to February) or embers (the rest of the year) drifting in and spiralling down into it.
+const fx2d = document.getElementById('fx2d'), fxc = fx2d.getContext('2d');
+const parts = [], hicSeen = new Map();
+let partsAt = 0, partsDrawn = false;
+const winter = () => [10, 11, 0, 1].includes(new Date().getMonth());   // November to February
+// (warm: step without drawing, so a preview starts with particles already in flight)
+function particles(vs, t, warm = 0) {
+  const dt = warm || Math.min((t - (partsAt || t)) / 1000, 0.05);
+  if (!warm) partsAt = t;
+  if (isShare) return;
+  if (fx2d.width !== canvas.width || fx2d.height !== canvas.height) { fx2d.width = canvas.width; fx2d.height = canvas.height; }
+  for (const v of vs) {
+    if (v.h.deathAt) continue;
+    const bits = lookOf(v.h).fxBits, R = 2.6 * v.rs;
+    if (bits & FXB.dust) {
+      const vx = previewDemo ? 420 : v.h.vx, vy = previewDemo ? -60 : v.h.vy, sp = Math.hypot(vx, vy);
+      for (let n = Math.random() < sp * dt / 6 ? Math.ceil(sp * dt / 6) : 0; n > 0 && parts.length < 600; n--) {
+        // shed from the trailing side, drifting back along the path it came
+        const ux = vx / sp, uy = vy / sp, side = (Math.random() - 0.5) * R * 1.6, back = R * (0.8 + 0.6 * Math.random());
+        parts.push({ kind: 'dust', x: v.x - ux * back - uy * side, y: v.y - uy * back + ux * side * 0.5, vx: -vx * 0.3 + (Math.random() - 0.5) * 30,
+                     vy: -vy * 0.3 + (Math.random() - 0.5) * 30, life: 0, max: 1.2 + Math.random(), size: R * (0.25 + 0.3 * Math.random()), hole: v.h.id });
+      }
+    }
+    if ((v.h.wind || 0) > 0.05 && parts.length < 600) {   // Eddington wind: gas blown outward off the disk
+      for (let n = Math.random() < dt * 90 * v.h.wind ? 2 : 0; n > 0; n--) {
+        const a = Math.random() * 6.283, sp = 160 + 140 * Math.random();
+        parts.push({ kind: 'wind', x: v.x + Math.cos(a) * R * 1.1, y: v.y + Math.sin(a) * R * 0.5, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp * 0.6,
+                     life: 0, max: 1.4, size: 1.5 + Math.random() * 1.5, hole: v.h.id, seed: Math.random() * 9 });
+      }
+    }
+    if (v.h.hicAt && v.h.hicAt !== hicSeen.get(v.h.id)) {   // a hiccup: a little puff
+      hicSeen.set(v.h.id, v.h.hicAt);
+      for (let n = 0; n < 7; n++) {
+        const a = -Math.PI / 2 + (Math.random() - 0.5) * 1.6, sp = 60 + 80 * Math.random();
+        parts.push({ kind: 'dust', x: v.x, y: v.y - R * 0.6, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0, max: 0.9, size: R * 0.25, hole: v.h.id });
+      }
+    }
+    if (bits & FXB.snow && Math.random() < dt * (previewDemo ? 40 : 7) && parts.length < 600) {
+      const a = Math.random() * 6.283, r = R * (4 + 5 * Math.random());
+      parts.push({ kind: winter() ? 'snow' : 'ember', x: v.x + Math.cos(a) * r, y: v.y + Math.sin(a) * r, vx: -Math.sin(a) * 40, vy: Math.cos(a) * 40,
+                   life: 0, max: 14, size: (winter() ? 1.6 : 1.2) + Math.random() * 1.6, hole: v.h.id, seed: Math.random() * 9 });
+    }
+  }
+  if (!parts.length && !warm) { if (partsDrawn) { fxc.clearRect(0, 0, fx2d.width, fx2d.height); partsDrawn = false; } return; }
+  if (!warm) { fxc.clearRect(0, 0, fx2d.width, fx2d.height); fxc.globalCompositeOperation = 'lighter'; }
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const q = parts[i], v = vs.find(v => v.h.id === q.hole);
+    q.life += dt;
+    if (q.kind === 'wind') { q.vx *= 1 - 0.4 * dt; q.vy *= 1 - 0.4 * dt; }
+    else if (q.kind !== 'dust' && v) {   // falls inward, swirling the way the disk turns, faster as it gets close
+      const dx = v.x - q.x, dy = v.y - q.y, d = Math.hypot(dx, dy) || 1, R = 2.6 * v.rs;
+      const g = 9e5 * (v.rs / 21) / Math.max(d, R) ** 1.4;
+      q.vx += (dx / d * g + dy / d * g * 0.6 + Math.sin(q.life * 2 + q.seed) * 8) * dt;
+      q.vy += (dy / d * g - dx / d * g * 0.6 + (q.kind === 'snow' ? 12 : -10)) * dt;
+      q.vx *= 1 - 0.6 * dt; q.vy *= 1 - 0.6 * dt;
+      if (d < R * 1.05) q.life = q.max;   // gone over the edge
+    } else { q.vx *= 1 - 1.5 * dt; q.vy *= 1 - 1.5 * dt; }
+    q.x += q.vx * dt; q.y += q.vy * dt;
+    if (q.life >= q.max || !v) { parts.splice(i, 1); continue; }
+    if (warm) continue;
+    const x = (q.x - origin.x) * pxScale, y = (q.y - origin.y) * pxScale, f = q.life / q.max;
+    if (q.kind === 'dust') {
+      const a = 0.07 * (1 - f) * Math.min(1, q.life * 6), s = q.size * (1 + f * 2.5);
+      const gr = fxc.createRadialGradient(x, y, 0, x, y, s);
+      gr.addColorStop(0, `rgba(220,170,140,${a})`); gr.addColorStop(1, 'rgba(200,130,100,0)');
+      fxc.fillStyle = gr; fxc.fillRect(x - s, y - s, s * 2, s * 2);
+    } else {
+      const a = Math.min(1, q.life * 2) * (1 - f * f) * (q.kind === 'snow' ? 0.75 : 0.6 + 0.4 * Math.sin(q.life * 9 + q.seed));
+      fxc.fillStyle = q.kind === 'wind' ? `rgba(200,220,255,${a * 0.8})` : q.kind === 'snow' ? `rgba(235,242,255,${a})` : `rgba(255,${120 + 60 * Math.sin(q.seed)},40,${a})`;
+      fxc.beginPath(); fxc.arc(x, y, q.size * (q.kind === 'ember' ? 0.8 : 1), 0, 6.283); fxc.fill();
+    }
+  }
+  fxc.globalCompositeOperation = 'source-over';
+  partsDrawn = true;
+}
+
+// The path you're drawing (and, after, fading), and the "event horizon" darkening of the whole screen.
+const ui2d = document.getElementById('ui2d'), uic = ui2d.getContext('2d');
+let pathFade = null, horizonAt = -1e9, uiDrawn = false;
+api.on('horizon', () => { horizonAt = performance.now(); });
+// Light paths in the hole's equatorial plane (Schwarzschild: u'' + u = 3/2 u^2, u = Rs/r), for a fan of impact parameters,
+// in units of Rs. Worked out once; each frame they're just drawn, scaled and placed.
+const BLUEPRINT = (() => {
+  const paths = [];
+  for (let b = -8; b <= 8.01; b += 1) {
+    if (Math.abs(b) < 0.3) continue;
+    let u = 1e-4, du = 1 / Math.abs(b), phi = 0;   // coming in from far away on the left
+    const pts = [], dphi = 0.01;
+    for (let k = 0; k < 2400; k++) {
+      const r = 1 / u, x = -r * Math.cos(phi), y = r * Math.sin(phi) * Math.sign(b);
+      if (k % 4 === 0) pts.push([x, y]);
+      if (u >= 1 || r > 30 && k > 50 && du < 0) break;   // fell in, or left
+      const a = -u + 1.5 * u * u;
+      du += a * dphi; u += du * dphi; phi += dphi;
+      if (u <= 0) break;
+    }
+    paths.push({ pts, captured: u >= 1 });
+  }
+  return paths;
+})();
+function drawBlueprint(vs) {
+  for (const v of vs) {
+    if (v.h.deathAt) continue;
+    const cx = (v.x - origin.x) * pxScale, cy = (v.y - origin.y) * pxScale, R = v.rs * pxScale, L = 11 * R;
+    uic.save();
+    uic.beginPath(); uic.arc(cx, cy, L, 0, 6.283); uic.clip();
+    uic.fillStyle = 'rgba(8,28,70,0.55)'; uic.fillRect(cx - L, cy - L, L * 2, L * 2);
+    uic.strokeStyle = 'rgba(120,180,255,0.14)'; uic.lineWidth = 1;
+    for (let g = -LENS; g <= LENS; g += 2) { uic.beginPath(); uic.moveTo(cx + g * R, cy - L); uic.lineTo(cx + g * R, cy + L); uic.moveTo(cx - L, cy + g * R); uic.lineTo(cx + L, cy + g * R); uic.stroke(); }
+    uic.lineWidth = Math.max(1, dpr);
+    for (const p of BLUEPRINT) {
+      uic.strokeStyle = p.captured ? 'rgba(255,150,120,0.55)' : 'rgba(150,215,255,0.6)';
+      uic.beginPath();
+      p.pts.forEach(([x, y], i) => (i ? uic.lineTo : uic.moveTo).call(uic, cx + x * R, cy - y * R));
+      uic.stroke();
+    }
+    const label = (r, text, dash, ang) => {
+      uic.setLineDash(dash); uic.strokeStyle = 'rgba(220,235,255,0.85)';
+      uic.beginPath(); uic.arc(cx, cy, r * R, 0, 6.283); uic.stroke(); uic.setLineDash([]);
+      uic.fillStyle = 'rgba(220,235,255,0.9)'; uic.font = `${11 * dpr}px "Segoe UI", sans-serif`;
+      uic.beginPath(); uic.moveTo(cx + Math.cos(ang) * r * R, cy - Math.sin(ang) * r * R); uic.lineTo(cx + Math.cos(ang) * 6.5 * R, cy - Math.sin(ang) * 6.5 * R); uic.stroke();
+      uic.fillText(text, cx + Math.cos(ang) * 6.5 * R + (Math.cos(ang) < 0 ? -uic.measureText(text).width - 4 * dpr : 4 * dpr), cy - Math.sin(ang) * 6.5 * R + 4 * dpr);
+    };
+    label(1, 'horizon', [], 2.6);
+    label(1.5, 'photon sphere', [4 * dpr, 4 * dpr], 0.55);
+    label(2.6, 'shadow edge', [1 * dpr, 4 * dpr], -0.55);
+    label(3, 'innermost stable orbit', [8 * dpr, 5 * dpr], -2.6);
+    uic.restore();
+  }
+}
+function uiLayer() {
+  const now = performance.now(), hz = (now - horizonAt) / 1000, pts = drawing?.pts || (pathFade && now - pathFade.at < 2500 ? pathFade.pts : null);
+  const bp = settings?.blueprint && !isShare;
+  if (!pts && hz > 3.2 && !bp) { if (uiDrawn) { uic.clearRect(0, 0, ui2d.width, ui2d.height); uiDrawn = false; } return; }
+  if (ui2d.width !== canvas.width || ui2d.height !== canvas.height) { ui2d.width = canvas.width; ui2d.height = canvas.height; }
+  uic.clearRect(0, 0, ui2d.width, ui2d.height);
+  uiDrawn = true;
+  if (bp) drawBlueprint(views(clock()).filter(v => v.fade > 0));
+  if (pts) {
+    const a = drawing ? 0.85 : 0.85 * (1 - (now - pathFade.at) / 2500);
+    uic.lineWidth = 3 * dpr; uic.lineCap = uic.lineJoin = 'round';
+    uic.setLineDash([2 * dpr, 9 * dpr]);
+    uic.strokeStyle = `rgba(255,190,140,${a})`;
+    uic.beginPath();
+    pts.forEach((p, i) => (i ? uic.lineTo : uic.moveTo).call(uic, (p[0] - origin.x) * pxScale, (p[1] - origin.y) * pxScale));
+    uic.stroke(); uic.setLineDash([]);
+  }
+  if (hz <= 3.2) {   // typed "event horizon": the edges of the screen darken, as if everything's falling in, then clear
+    const k = hz < 0.6 ? hz / 0.6 : hz < 1.4 ? 1 : Math.max(0, 1 - (hz - 1.4) / 1.8);
+    const W = ui2d.width, H = ui2d.height, g = uic.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.25, W / 2, H / 2, Math.hypot(W, H) / 2);
+    g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, `rgba(0,0,0,${0.92 * k})`);
+    uic.fillStyle = g; uic.fillRect(0, 0, W, H);
+  }
+}
+
+// Hover a hole for a moment: how it's feeling, in a small tag beside it.
+const GLYPH = { floating: '☄', scared: '!', jealous: '◑', sulking: '︶', hiccups: '∘', hungry: '◔', sleepy: '☾', excited: '✦', content: '♡', purring: '♡', dancing: '♪', bored: '…', queasy: '≈', quiet: '·', parked: '‖', calm: '·' };
+let tagFor = -1, tagSince = 0, overTag = false;
+function moodTag(vs, t) {
+  const el = document.getElementById('moodtag');
+  const v = (over >= 0 || overTag) && !myDrag ? vs.find(v => v.h.id === (overTag ? tagFor : over) && !v.h.deathAt) : null;
+  if (!v) { tagFor = -1; el.classList.remove('on'); return; }
+  if (tagFor !== over) { tagFor = over; tagSince = t; }
+  if (t - tagSince < 600) return;
+  const mood = v.h.mood || 'calm', R = 2.6 * v.rs / dpr;
+  const name = v.h.name || 'Black hole', text = `${name} ${GLYPH[mood] || '·'} ${mood}`;
+  if (el.dataset.text !== text) {
+    el.dataset.text = text; el.innerHTML = '';
+    const n = document.createElement('span'); n.className = 'nm'; n.textContent = name; n.title = 'Rename';
+    const b = document.createElement('b'); b.textContent = GLYPH[mood] || '·';
+    el.append(n, b, mood);
+  }
+  el.style.left = Math.min((v.x - origin.x) / dpr + R * 1.25, innerWidth - el.offsetWidth - 8) + 'px';
+  el.style.top = Math.max((v.y - origin.y) / dpr - R * 1.15, 8) + 'px';
+  el.classList.add('on');
+}
+
+// Music playing on the PC (any app): the hole dances to it. The PC's sound output is analysed here, live, for loudness
+// and bass hits; nothing is recorded or kept. Off with Settings -> Sound -> "Dance to music on the PC".
+const listen = (() => {
+  let ac = null, an = null, buf = null, stream = null, starting = false, failedAt = 0;
+  let avg = 0, on = 0, lastBeat = 0, prev = null, acc = 0, flux = 0, lvl = 0;
+  const beats = [];
+  async function start() {
+    if (starting || clock() - failedAt < 60000) return;
+    starting = true;
+    try {
+      let s;
+      try { s = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: { width: 16, height: 16, frameRate: 1 } }); }
+      catch { s = await navigator.mediaDevices.getUserMedia({ audio: { mandatory: { chromeMediaSource: 'desktop' } }, video: { mandatory: { chromeMediaSource: 'desktop', maxWidth: 16, maxHeight: 16, maxFrameRate: 1 } } }); }
+      for (const tr of s.getVideoTracks()) tr.stop();
+      if (!s.getAudioTracks().length) throw new Error('no audio track');
+      stream = s; ac = new AudioContext();
+      an = ac.createAnalyser(); an.fftSize = 1024; an.smoothingTimeConstant = 0;
+      ac.createMediaStreamSource(s).connect(an);
+      buf = new Float32Array(an.frequencyBinCount);
+      api.send('log', 'info', 'listening to the PC\'s sound for music');
+    } catch (e) { failedAt = clock(); api.send('log', 'warn', `can't hear the PC's sound: ${e.message}`); }
+    starting = false;
+  }
+  function stop() { stream?.getTracks().forEach(tr => tr.stop()); ac?.close(); ac = an = stream = null; on = 0; }
+  return {
+    sample(enabled, dt) {
+      if (!enabled) { if (an) stop(); return { on: 0, beat: false }; }
+      if (!an) { start(); return { on: 0, beat: false }; }
+      // Onsets (snares, hats, the click of a kick, voices) by spectral flux: how much the 200 Hz - 4 kHz bands suddenly
+      // got louder, compared with its recent average. Below 200 Hz is left out: that's where our own hum and purr are.
+      // Sampled at a steady 50 times a second.
+      acc += dt;
+      if (acc < 0.02) return { on, beat: false };
+      const step = acc; acc = 0;
+      an.getFloatFrequencyData(buf);   // dB per band
+      const hz = ac.sampleRate / an.fftSize, top = Math.min(buf.length, Math.ceil(4000 / hz));
+      prev ||= new Float32Array(buf.length);
+      let all = 0; flux = 0;
+      for (let i = Math.ceil(200 / hz); i < top; i++) {
+        const m = buf[i] > -160 ? Math.pow(10, buf[i] / 20) : 0;   // amplitude
+        all += m * m;
+        if (m > prev[i]) flux += m - prev[i];
+        prev[i] = m;
+      }
+      const t = clock() / 1000;
+      // Loud enough to be music (the PC's idle noise floor is about 1e-6), and not one of our own gulps or chirps.
+      lvl = Math.max(all, lvl * Math.exp(-step / 0.7));
+      const beat = flux > avg * 1.8 && lvl > 1e-4 && t - lastBeat > 0.25 && clock() > ownSoundUntil;
+      avg += (flux - avg) * Math.min(1, step / 0.6);
+      if (beat) { lastBeat = t; beats.push(t); }
+      while (beats.length && t - beats[0] > 4) beats.shift();
+      const playing = beats.length >= 4 && lvl > 1e-4;   // a steady run of hits, not one notification ding
+      on += ((playing ? 1 : 0) - on) * Math.min(1, step / (playing ? 1.5 : 3));
+      this.last = { flux, avg, all, lvl, beats: beats.length };   // for checking what it hears
+      return { on, beat };
+    },
+  };
+})();
+
+api.on('init', init => {
+  settings = init.settings; displays = init.displays; Object.assign(origin, init.origin);
+  document.body.classList.toggle('large', !!settings.largeLabels);
+  if (init.boredAfter) boredAfter = init.boredAfter;
+  isLeader = init.leader; isShare = !!init.share; paused = !!init.paused;
+  if (isShare) pxScale = canvas.width / origin.width;
+  if (isLeader) { adopt(init.state); if (!holes.length) spawnFirst(); }
+  else if (init.state) { holes = init.state.holes; stamp = init.state.t; }
+  ready = true;
+});
+api.on('role', (leader, state) => {
+  if (!ready || isShare) return;   // 'init' (still on its way) carries the role too
+  if (leader && !isLeader) { adopt(state); if (!holes.length && !hadHoles) spawnFirst(); }
+  isLeader = leader;
+});
+api.on('state', s => { if (!isLeader) { holes = s.holes; stamp = s.t; } });
+api.on('input', m => { if (isLeader) onInput(m); });
+api.on('displays', d => { displays = d; });
+api.on('origin', o => { if (!isShare) Object.assign(origin, o); });
+api.on('settings', s => {
+  document.body.classList.toggle('large', !!s.largeLabels);
+  if (isLeader && settings && s.bhSpin !== settings.bhSpin) for (const h of holes) if (h.overrides?.bhSpin == null) h.spin = +s.bhSpin;
+  settings = s; lastDraw = 0;
+  if ((s.quality || 'auto') !== 'auto') slowFrames = fastFrames = 0;
+});
+api.on('paused', p => { paused = p; });
+addEventListener('resize', () => { if (isShare && origin.width) pxScale = canvas.width / origin.width; });
+addEventListener('error', e => api.send('log', 'error', `${e.message} (${e.filename}:${e.lineno})`));
+requestCapture();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

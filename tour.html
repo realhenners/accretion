@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Welcome to Accretion</title>
+<style>
+  /* First-launch tour: a few cards, Windows 11 style, keyboard friendly. */
+  :root { --accent: #0078d4; --bg: #f3f3f3; --text: #1a1a1a; --text2: #5d5d5d; --card: rgba(255,255,255,0.7); --stroke: rgba(0,0,0,0.08); }
+  @media (prefers-color-scheme: dark) { :root { --bg: #202020; --text: #fff; --text2: #c5c5c5; --card: rgba(255,255,255,0.05); --stroke: rgba(255,255,255,0.08); } }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font: 14px/20px "Segoe UI Variable Text", "Segoe UI", sans-serif; user-select: none; }
+  main { display: flex; flex-direction: column; height: 100%; box-sizing: border-box; padding: 26px 28px 20px; }
+  .step { display: none; flex: 1; }
+  .step.on { display: block; }
+  .glyph { width: 56px; height: 56px; border-radius: 12px; background: var(--card); border: 1px solid var(--stroke); display: grid; place-items: center; font-size: 26px; margin-bottom: 16px; }
+  h1 { font: 600 22px/28px "Segoe UI Variable Display", "Segoe UI", sans-serif; margin: 0 0 8px; }
+  p { margin: 0 0 8px; color: var(--text2); }
+  kbd { font: 12px "Segoe UI", sans-serif; padding: 1px 6px; border: 1px solid var(--stroke); border-radius: 4px; background: var(--card); color: var(--text); }
+  footer { display: flex; align-items: center; gap: 8px; }
+  .dots { flex: 1; display: flex; gap: 6px; }
+  .dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--text2); opacity: 0.35; }
+  .dots span.on { opacity: 1; background: var(--accent); }
+  button { font: inherit; height: 32px; padding: 0 16px; border-radius: 4px; border: 1px solid var(--stroke); background: var(--card); color: var(--text); }
+  button.primary { background: var(--accent); border-color: transparent; color: #fff; }
+  button:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+</style>
+</head>
+<body>
+<main>
+  <section class="step on" aria-live="polite">
+    <div class="glyph" aria-hidden="true">●</div>
+    <h1>This is your black hole</h1>
+    <p>It sits on top of your screen and bends everything behind it, like a real one. Nothing you see it do changes your files or windows.</p>
+    <p>Drag it to move it. Let go while moving to throw it. Scroll on it to make it heavier or lighter.</p>
+  </section>
+  <section class="step" aria-live="polite">
+    <div class="glyph" aria-hidden="true">↓</div>
+    <h1>Feed it</h1>
+    <p>Hold it still over a window for a moment, then let go: it swallows the window. Or drag things onto it: files, folders, pictures, text, a link.</p>
+    <p>Nothing is lost. Right-click it to spit things back out, or press <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Z</kbd> to undo the last meal.</p>
+  </section>
+  <section class="step" aria-live="polite">
+    <div class="glyph" aria-hidden="true">♡</div>
+    <h1>It's a pet</h1>
+    <p>It gets hungry, bored and sleepy, and it has moods. Slowly circle the cursor round its edge to pet it. Rest the cursor on it to see how it's feeling.</p>
+    <p>Feeding it spins it up and makes it grow. Look after it and it may have babies.</p>
+  </section>
+  <section class="step" aria-live="polite">
+    <div class="glyph" aria-hidden="true">⋯</div>
+    <h1>Right-click for everything else</h1>
+    <p>Name it, make it stay put, share it, change how it looks, and see everything it's eaten and done (its journal) in Settings.</p>
+    <p>Some things are hidden. Try things and see what happens.</p>
+  </section>
+  <footer>
+    <div class="dots" aria-hidden="true"><span class="on"></span><span></span><span></span><span></span></div>
+    <button id="back">Back</button>
+    <button id="next" class="primary">Next</button>
+  </footer>
+</main>
+<script>
+const steps = [...document.querySelectorAll('.step')], dots = [...document.querySelectorAll('.dots span')];
+let at = 0;
+function go(i) {
+  if (i >= steps.length) { window.app.send('tour-done'); return; }
+  at = Math.max(0, i);
+  steps.forEach((s, k) => s.classList.toggle('on', k === at));
+  dots.forEach((d, k) => d.classList.toggle('on', k === at));
+  document.getElementById('back').style.visibility = at ? 'visible' : 'hidden';
+  document.getElementById('next').textContent = at === steps.length - 1 ? 'Done' : 'Next';
+}
+document.getElementById('next').onclick = () => go(at + 1);
+document.getElementById('back').onclick = () => go(at - 1);
+addEventListener('keydown', e => { if (e.key === 'ArrowRight') go(at + 1); if (e.key === 'ArrowLeft') go(at - 1); if (e.key === 'Escape') window.app.send('tour-done'); });
+go(0);
+document.getElementById('next').focus();
+</script>
+</body>
+</html>
